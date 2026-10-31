@@ -58,6 +58,26 @@ MIGRATIONS: tuple[tuple[str, ...], ...] = (
             FOREIGN KEY(task_id, run_id, user_id) REFERENCES tasks(task_id, run_id, user_id))""",
         "CREATE INDEX steps_run_ordinal ON steps(run_id, ordinal)",
     ),
+    (
+        """CREATE TABLE invocations (
+            invocation_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, task_id TEXT NOT NULL,
+            user_id TEXT NOT NULL, step_id TEXT NOT NULL REFERENCES steps(step_id),
+            call_id TEXT NOT NULL, status TEXT NOT NULL, snapshot TEXT NOT NULL,
+            UNIQUE(step_id, call_id),
+            FOREIGN KEY(task_id,run_id,user_id) REFERENCES tasks(task_id,run_id,user_id))""",
+        """CREATE TABLE approvals (
+            invocation_id TEXT PRIMARY KEY REFERENCES invocations(invocation_id),
+            user_id TEXT NOT NULL, tool_version TEXT NOT NULL, argument_hash TEXT NOT NULL,
+            approved INTEGER NOT NULL, expires_at TEXT NOT NULL)""",
+        """CREATE TABLE artifacts (
+            artifact_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, task_id TEXT NOT NULL,
+            user_id TEXT NOT NULL, name TEXT NOT NULL, version INTEGER NOT NULL,
+            status TEXT NOT NULL, snapshot TEXT NOT NULL,
+            UNIQUE(user_id,run_id,task_id,name,version),
+            FOREIGN KEY(task_id,run_id,user_id) REFERENCES tasks(task_id,run_id,user_id))""",
+        "CREATE INDEX invocations_run ON invocations(user_id,run_id)",
+        "CREATE INDEX artifacts_run ON artifacts(user_id,run_id)",
+    ),
 )
 
 

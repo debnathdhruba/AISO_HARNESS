@@ -15,7 +15,14 @@ from agent_harness.application.runs import RunService
 from agent_harness.domain.entities import JsonObject
 from agent_harness.domain.errors import ErrorCode, HarnessError
 from agent_harness.domain.model import (
-    FinishReason, Message, ModelResponse, Role, RunOptions, Stage, StepStatus, ToolCall,
+    FinishReason,
+    Message,
+    ModelResponse,
+    Role,
+    RunOptions,
+    Stage,
+    StepStatus,
+    ToolCall,
 )
 from agent_harness.domain.states import RunStatus
 from agent_harness.interfaces.cli import app
@@ -32,14 +39,24 @@ def answer(text: str = "Final answer") -> ModelResponse:
 @pytest.mark.asyncio
 async def test_two_models_ordered_messages_and_inspect(store: SQLiteStore) -> None:
     clock, ids = FixedClock(), SequenceIds()
-    run = await RunService(store, clock, ids).submit("alice", "Explain a queue", RunOptions())
+    run = await RunService(store, clock, ids).submit(
+        "alice",
+        "Explain a queue",
+        RunOptions(
+            routing_mode="two_stage",
+        ),
+    )
     model = ScriptedModel((answer("Draft"), answer("A queue keeps waiting items.")))
     result = await AgentRunner(store, ModelGateway(model), clock, ids).execute("alice", run.run_id)
     assert result.status == RunStatus.COMPLETED
     assert result.result is not None and json.loads(result.result.text)["verified"] is False
     assert [request.model for request in model.requests] == ["lfm2.5-thinking:1.2b", "gemma3:1b"]
     assert [m.role for m in model.requests[1].messages] == [
-        Role.SYSTEM, Role.USER, Role.ASSISTANT, Role.USER]
+        Role.SYSTEM,
+        Role.USER,
+        Role.ASSISTANT,
+        Role.USER,
+    ]
     assert model.requests[1].messages[2].content == "Draft"
     async with store.transaction("alice") as tx:
         steps = await tx.steps(run.run_id)
@@ -51,18 +68,36 @@ async def test_two_models_ordered_messages_and_inspect(store: SQLiteStore) -> No
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("response", [
-    answer(""), ModelResponse(Message(Role.ASSISTANT, "truncated"), FinishReason.LENGTH),
-    ModelResponse(Message(Role.ASSISTANT, "unsupported"), FinishReason.UNSUPPORTED),
-    ModelResponse(Message(Role.ASSISTANT, "Do not treat this as final", (
-        ToolCall("call-1", "calculator", JsonObject('{"a":1}')),
-        ToolCall("call-2", "calculator", JsonObject('{"a":2}')),
-    )), FinishReason.STOP),
-])
-async def test_invalid_or_action_response_never_completes(store: SQLiteStore,
-                                                         response: ModelResponse) -> None:
+@pytest.mark.parametrize(
+    "response",
+    [
+        answer(""),
+        ModelResponse(Message(Role.ASSISTANT, "truncated"), FinishReason.LENGTH),
+        ModelResponse(Message(Role.ASSISTANT, "unsupported"), FinishReason.UNSUPPORTED),
+        ModelResponse(
+            Message(
+                Role.ASSISTANT,
+                "Do not treat this as final",
+                (
+                    ToolCall("call-1", "calculator", JsonObject('{"a":1}')),
+                    ToolCall("call-2", "calculator", JsonObject('{"a":2}')),
+                ),
+            ),
+            FinishReason.STOP,
+        ),
+    ],
+)
+async def test_invalid_or_action_response_never_completes(
+    store: SQLiteStore, response: ModelResponse
+) -> None:
     clock, ids = FixedClock(), SequenceIds()
-    run = await RunService(store, clock, ids).submit("alice", "Task", RunOptions())
+    run = await RunService(store, clock, ids).submit(
+        "alice",
+        "Task",
+        RunOptions(
+            routing_mode="two_stage",
+        ),
+    )
     model = ScriptedModel((response,))
     result = await AgentRunner(store, ModelGateway(model), clock, ids).execute("alice", run.run_id)
     assert result.status == RunStatus.FAILED
@@ -79,8 +114,16 @@ async def test_malformed_adapter_response(store: SQLiteStore) -> None:
             return {"unexpected": "not a normalized response"}
 
     clock, ids = FixedClock(), SequenceIds()
-    run = await RunService(store, clock, ids).submit("alice", "Task", RunOptions())
-    result = await AgentRunner(store, ModelGateway(Malformed(())), clock, ids).execute("alice", run.run_id)
+    run = await RunService(store, clock, ids).submit(
+        "alice",
+        "Task",
+        RunOptions(
+            routing_mode="two_stage",
+        ),
+    )
+    result = await AgentRunner(store, ModelGateway(Malformed(())), clock, ids).execute(
+        "alice", run.run_id
+    )
     assert result.status == RunStatus.FAILED
     async with store.transaction("alice") as tx:
         assert (await tx.steps(run.run_id))[0].status == StepStatus.FAILED
@@ -89,7 +132,9 @@ async def test_malformed_adapter_response(store: SQLiteStore) -> None:
 @pytest.mark.asyncio
 async def test_steps_do_not_reset_on_continuation(store: SQLiteStore) -> None:
     clock, ids = FixedClock(), SequenceIds()
-    run = await RunService(store, clock, ids).submit("alice", "Task", RunOptions(max_steps=1))
+    run = await RunService(store, clock, ids).submit(
+        "alice", "Task", RunOptions(routing_mode="two_stage", max_steps=1)
+    )
     model = ScriptedModel((answer("Draft"), answer()))
     runner = AgentRunner(store, ModelGateway(model), clock, ids)
     result = await runner.execute("alice", run.run_id)
@@ -113,7 +158,9 @@ class MovingClock(FixedClock):
 @pytest.mark.parametrize("expire_during_call", [False, True])
 async def test_deadline_with_fake_clock(store: SQLiteStore, expire_during_call: bool) -> None:
     clock, ids = MovingClock(), SequenceIds()
-    run = await RunService(store, clock, ids).submit("alice", "Task", RunOptions(timeout_seconds=5))
+    run = await RunService(store, clock, ids).submit(
+        "alice", "Task", RunOptions(routing_mode="two_stage", timeout_seconds=5)
+    )
 
     class SlowFake(ScriptedModel):
         async def generate(self, request):
@@ -143,8 +190,9 @@ class CrashAfterAcceptance:
         async with self.store.transaction(user_id) as tx:
             yield tx
             steps = await tx.steps(self.run_id)
-            crash = bool(steps and steps[-1].stage == self.stage and
-                         steps[-1].status == StepStatus.ACCEPTED)
+            crash = bool(
+                steps and steps[-1].stage == self.stage and steps[-1].status == StepStatus.ACCEPTED
+            )
         if crash:
             raise SimulatedCrash("after durable response acceptance, before application")
 
@@ -156,14 +204,23 @@ async def test_restart_never_regenerates_accepted_response(tmp_path: Path, stage
     clock, ids = FixedClock(), SequenceIds()
     first = ScriptedModel((answer("Saved draft"), answer("Saved final")))
     async with SQLiteStore(path, clock, ids) as store:
-        run = await RunService(store, clock, ids).submit("alice", "Task", RunOptions())
-        runner = AgentRunner(CrashAfterAcceptance(store, run.run_id, stage),
-                             ModelGateway(first), clock, ids)
+        run = await RunService(store, clock, ids).submit(
+            "alice",
+            "Task",
+            RunOptions(
+                routing_mode="two_stage",
+            ),
+        )
+        runner = AgentRunner(
+            CrashAfterAcceptance(store, run.run_id, stage), ModelGateway(first), clock, ids
+        )
         with pytest.raises(SimulatedCrash):
             await runner.execute("alice", run.run_id)
     resumed = ScriptedModel((answer("Saved final"),) if stage == Stage.DECISION else ())
     async with SQLiteStore(path, clock, ids) as store:
-        result = await AgentRunner(store, ModelGateway(resumed), clock, ids).execute("alice", run.run_id)
+        result = await AgentRunner(store, ModelGateway(resumed), clock, ids).execute(
+            "alice", run.run_id
+        )
         assert result.status == RunStatus.COMPLETED
         assert result.result is not None and "Saved final" in result.result.text
         assert len(first.requests) + len(resumed.requests) == 2
@@ -183,7 +240,13 @@ async def test_cancelled_model_call_is_durable(store: SQLiteStore) -> None:
             return answer()
 
     clock, ids = FixedClock(), SequenceIds()
-    run = await RunService(store, clock, ids).submit("alice", "Task", RunOptions())
+    run = await RunService(store, clock, ids).submit(
+        "alice",
+        "Task",
+        RunOptions(
+            routing_mode="two_stage",
+        ),
+    )
     runner = AgentRunner(store, ModelGateway(WaitingFake(())), clock, ids)
     async with asyncio.timeout(5):
         work = asyncio.create_task(runner.execute("alice", run.run_id))
@@ -213,15 +276,25 @@ def test_context_keeps_complete_tool_groups() -> None:
 def test_cli_offline_submit_inspect_events(tmp_path: Path) -> None:
     cli = CliRunner()
     database = str(tmp_path / "cli.sqlite")
-    submitted = cli.invoke(app, ["run", "--task", "demo", "--user", "alice", "--database", database])
+    submitted = cli.invoke(
+        app, ["run", "--task", "demo", "--user", "alice", "--database", database]
+    )
     assert submitted.exit_code == 0, submitted.output
     run = json.loads(submitted.stdout)
     assert run["status"] == "completed"
-    inspected = cli.invoke(app, ["inspect", run["run_id"], "--user", "alice", "--database", database])
+    inspected = cli.invoke(
+        app, ["inspect", run["run_id"], "--user", "alice", "--database", database]
+    )
     assert inspected.exit_code == 0, inspected.output
     assert [s["model"] for s in json.loads(inspected.stdout)["steps"]] == [
-        "lfm2.5-thinking:1.2b", "gemma3:1b"]
+        "gemma3:1b",
+    ]
     events = cli.invoke(app, ["events", run["run_id"], "--user", "alice", "--database", database])
     assert events.exit_code == 0
     assert "step.accepted" in events.stdout
-    assert cli.invoke(app, ["inspect", run["run_id"], "--user", "bob", "--database", database]).exit_code != 0
+    assert (
+        cli.invoke(
+            app, ["inspect", run["run_id"], "--user", "bob", "--database", database]
+        ).exit_code
+        != 0
+    )

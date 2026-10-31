@@ -2,6 +2,17 @@
 
 from agent_harness.domain.errors import ErrorCode, HarnessError, require
 from agent_harness.domain.model import Message, Role
+from agent_harness.domain.tooling import ToolSpec
+
+
+def tool_schema_size(tools: tuple[ToolSpec, ...]) -> int:
+    return sum(
+        len(t.input_schema.text.encode("utf-8"))
+        + len(t.description.encode("utf-8"))
+        + len(t.name.encode("utf-8"))
+        + 64
+        for t in tools
+    )
 
 
 def size(messages: tuple[Message, ...]) -> int:

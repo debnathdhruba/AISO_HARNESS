@@ -14,6 +14,7 @@ from agent_harness.domain.errors import HarnessError
 from agent_harness.domain.model import RunOptions
 from agent_harness.domain.states import RunStatus
 from agent_harness.models.codec import encode_step
+from agent_harness.tools.executor import decide_approval
 
 app = typer.Typer(no_args_is_help=True, help="Standalone agent harness: offline or local Ollama.")
 
@@ -60,9 +61,19 @@ def run_command(
     config: Annotated[Path | None, typer.Option(help="TOML settings path")] = None,
     max_steps: Annotated[int | None, typer.Option()] = None,
     timeout: Annotated[int | None, typer.Option(help="Total run deadline in seconds")] = None,
+    require_write_approval: Annotated[bool | None, typer.Option()] = None,
+    workspace: Annotated[str | None, typer.Option()] = None,
+    mode: Annotated[str | None, typer.Option(help="auto, chat, tools, or two_stage")] = None,
 ) -> None:
     settings = load_settings(
-        config, provider=provider, database=database, max_steps=max_steps, timeout_seconds=timeout
+        config,
+        provider=provider,
+        database=database,
+        max_steps=max_steps,
+        timeout_seconds=timeout,
+        require_write_approval=require_write_approval,
+        workspace=workspace,
+        routing_mode=mode,
     )
     result = asyncio.run(execute(settings, user, task, None))
     typer.echo(json.dumps(summary(result), indent=2))
@@ -92,6 +103,36 @@ async def inspect_run(
         result = summary(run)
         async with services.store.transaction(user) as tx:
             steps = await tx.steps(run_id)
+            invocations = await tx.invocations(run_id)
+            artifacts = await tx.artifacts(run_id)
+        result["invocations"] = [
+            {
+                "invocation_id": i.invocation_id,
+                "tool": i.tool_name,
+                "version": i.tool_version,
+                "step_id": i.step_id,
+                "call_id": i.call_id,
+                "argument_hash": i.argument_hash,
+                "arguments": json.loads(i.arguments.text),
+                "status": i.status.value,
+                "result": json.loads(i.result.text) if i.result else None,
+                "error": json.loads(i.error.text) if i.error else None,
+                "approval_expires_at": i.approval_expires_at.isoformat()
+                if i.approval_expires_at
+                else None,
+            }
+            for i in invocations
+        ]
+        result["artifacts"] = [
+            {
+                "artifact_id": a.artifact_id,
+                "name": a.name,
+                "version": a.version,
+                "status": a.status,
+                "checksum": a.checksum,
+            }
+            for a in artifacts
+        ]
         result["steps"] = [
             json.loads(encode_step(step))["data"]
             if history
@@ -128,6 +169,43 @@ def inspect_command(
     typer.echo(json.dumps(value, indent=2))
 
 
+@app.command("trace")
+def trace_command(
+    run_id: str,
+    user: Annotated[str, typer.Option(help="Trusted-local principal")],
+    database: Annotated[Path | None, typer.Option()] = None,
+    config: Annotated[Path | None, typer.Option()] = None,
+) -> None:
+    """Show the persisted model, tool and lifecycle trace for one run."""
+
+    async def read() -> dict[str, object]:
+        settings = load_settings(config, database=database)
+        value = await inspect_run(settings, user, run_id, history=True)
+        async with application(settings) as services:
+            async with services.store.transaction(user) as tx:
+                events = []
+                after = 0
+                while True:
+                    batch = await tx.events(run_id, after=after, limit=1000)
+                    events.extend(batch)
+                    if len(batch) < 1000:
+                        break
+                    after = batch[-1].sequence
+        value["events"] = [
+            {
+                "sequence": event.sequence,
+                "type": event.event_type,
+                "task_id": event.task_id,
+                "timestamp": event.timestamp.isoformat(),
+                "payload": json.loads(event.payload.text),
+            }
+            for event in events
+        ]
+        return value
+
+    typer.echo(json.dumps(asyncio.run(read()), indent=2))
+
+
 @app.command("events")
 def events_command(
     run_id: str,
@@ -150,6 +228,39 @@ def events_command(
             ]
 
     typer.echo(json.dumps(asyncio.run(read()), indent=2))
+
+
+def approval_command(
+    invocation_id: str, user: str, digest: str, database: Path | None, approve: bool
+) -> None:
+    async def decide() -> None:
+        async with application(load_settings(database=database)) as services:
+            await decide_approval(services.store, user, invocation_id, digest, approve)
+
+    asyncio.run(decide())
+    typer.echo("Approval recorded. Use continue RUN_ID to advance the run.")
+
+
+@app.command("approve")
+def approve_command(
+    invocation_id: str,
+    user: Annotated[str, typer.Option()],
+    argument_hash: Annotated[str, typer.Option()],
+    database: Annotated[Path | None, typer.Option()] = None,
+) -> None:
+    """Approve the exact invocation and argument hash shown by inspect."""
+    approval_command(invocation_id, user, argument_hash, database, True)
+
+
+@app.command("deny")
+def deny_command(
+    invocation_id: str,
+    user: Annotated[str, typer.Option()],
+    argument_hash: Annotated[str, typer.Option()],
+    database: Annotated[Path | None, typer.Option()] = None,
+) -> None:
+    """Deny an invocation; continuation feeds the denial back to the agent."""
+    approval_command(invocation_id, user, argument_hash, database, False)
 
 
 def main() -> None:

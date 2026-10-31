@@ -8,7 +8,14 @@ version = "0.1.0"
 description = "Standalone durable agent harness"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = ["aiosqlite", "httpx", "pydantic>=2,<3", "typer"]
+dependencies = [
+    "aiosqlite",
+    "httpx",
+    "pydantic>=2,<3",
+    "typer",
+    "jsonschema",
+    "pytest>=9.2.0",
+]
 
 [project.scripts]
 agent-harness = "agent_harness.interfaces.cli:main"
@@ -40,3 +47,7 @@ testpaths = ["tests"]
 asyncio_mode = "strict"
 asyncio_default_fixture_loop_scope = "function"
 addopts = "--strict-config --strict-markers"
+
+[[tool.mypy.overrides]]
+module = ["jsonschema", "jsonschema.*"]
+ignore_missing_imports = true

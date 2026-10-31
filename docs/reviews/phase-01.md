@@ -60,7 +60,7 @@ From `AIOS_HARNESS`:
 
 ```powershell
 New-Item -ItemType Directory -Force .local | Out-Null
-.\.venv\Scripts\python.exe examples\persisted_state.py --database .local\phase-01.sqlite
+.\.venv\Scripts\python.exe examples\persisted_state.py
 .\.venv\Scripts\python.exe -m pytest -q
 .\.venv\Scripts\python.exe -m ruff check .
 .\.venv\Scripts\python.exe -m ruff format --check .
@@ -70,7 +70,7 @@ New-Item -ItemType Directory -Force .local | Out-Null
 Observed sample run: `5d5e4822-0b8a-487e-a111-de67b41a4c96`, status queued,
 version 1, checkpoint state version 1. Events: 1 run.created, 2 task.created,
 3 run.transitioned, 4 task.transitioned. The database remains in
-`.local/phase-01.sqlite` for review. Subsequent runs generate new IDs.
+`.local/harness.sqlite` for review. Subsequent runs generate new IDs.
 
 ## Decisions, limitations and implications
 

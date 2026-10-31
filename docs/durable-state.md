@@ -6,7 +6,8 @@ Implemented sources: `domain/entities.py`, `domain/states.py`, `domain/errors.py
 ## Entities and identifiers
 
 RunConfig snapshots definition/version, model, policy, budget, memory and workspace
-settings. Run stores principal, input, status, timestamps, deadline, version,
+settings. Model settings retain separate workspace and artifact-root paths for
+recovery. Run stores principal, input, status, timestamps, deadline, version,
 control intent, result and error. Task stores scope, objective, acceptance criteria,
 parent/dependencies, assigned instance ID, status, timestamps, deadline, version
 and result. IDs are canonical UUIDs; UUID generation and UTC/monotonic time are
@@ -61,11 +62,57 @@ phase records intent only; scheduling and cancellation effects come later.
 | task_dependencies | task/dependency pair; scoped FKs | Durable dependency references |
 | events | run/sequence; unique event UUID | Append-only versioned metadata |
 | checkpoints | task UUID; scoped task FK and event FK | Versioned serialized continuation |
+| steps | task/ordinal; run-scoped snapshot | Complete model request and accepted response for each reasoning step |
+| invocations | step/call; run-scoped snapshot | Tool identity, arguments, state, result and error for each call |
+| approvals | invocation UUID | User approval/denial bound to exact tool version and arguments |
+| artifacts | artifact UUID and task/name/version | Bounded local artifact manifest and integrity metadata |
 
 Migration 1 creates base state, relationships, events, checkpoints, indexes and
 append-only event triggers. Migration 2 adds the run control_intent column with a
-default of none. All pending migrations run in one transaction. Unsupported or
-non-contiguous history is rejected. Opening a current database is idempotent.
+default of none. Later migrations add model steps, tool invocations, approvals
+and artifact manifests. All pending migrations run in one transaction.
+Unsupported or non-contiguous history is rejected. Opening a current database
+is idempotent.
+
+## Local database and agent trace
+
+The default path is `.local/harness.sqlite`. TOML examples use the same path;
+separate example-specific database files are not needed. The `database`
+setting/CLI option remains available when a user explicitly wants isolated
+state. SQLite's `-wal` and `-shm` files are temporary sidecars, not separate
+application databases.
+
+There is no second trace database to keep synchronized. The same SQLite file
+contains the full durable trace: `steps` stores the exact model and messages
+sent plus the accepted assistant response; `invocations` stores tool arguments,
+status, result and error; `events` stores the ordered run/task/step/tool state
+transitions. The `trace RUN_ID` CLI command combines these records, including
+private prompt and tool data, after enforcing run ownership. `runs` and `tasks`
+hold current state, `checkpoints` enables continuation, `approvals` records
+write decisions, and `artifacts` indexes workspace outputs. `task_dependencies`
+is ready for durable dependency relationships; it is currently empty when no
+multi-task coordination has been implemented.
+
+This trace is local but contains potentially sensitive prompts and tool data.
+Protect the database file with host permissions and avoid sharing trace output
+without reviewing it.
+
+## Resource admission (Phase 4)
+
+The application composition root owns one `ResourceScheduler` and shares it with
+all run runners in that application lifetime. Model calls use the configured
+provider key; tools and filesystem/artifact operations use separate bounded
+lanes. A reserved memory lane is available for the later memory phase. Limits
+include global active capacity, finite queue length, and model per-provider
+capacity. Queue-full, queued cancellation, timeout, and shutdown are distinct
+outcomes; work rejected before admission is never invoked. `snapshot()` reports
+per-lane active, queued, configured capacity, and shutdown state.
+
+The blocking adapter bounds submitted synchronous tools with fixed workers plus
+a finite queue. Cancelling or timing out its asyncio caller does not terminate a
+Python worker thread. The adapter retains the slot and drains in-flight work on
+graceful shutdown; any write whose result was abandoned remains subject to the
+existing uncertain-side-effect policy.
 
 Checkpoint creation uses expected_version=None and version=0. Replacement requires
 the previous checkpoint version and increments it by one. Its state_version must

@@ -50,6 +50,12 @@ The runner advances one bounded decision; the coordinator owns dependencies and
 child relationships. Task admission is round-robin across runs, FIFO within runs.
 Resource admission separately bounds queues and provider/tool capacity. Waiting
 parents release task slots. Cancellation intent is distinct from confirmed stop.
+Phase 4 implements in-process model, tool, artifact and memory admission lanes:
+queues reject excess work explicitly, model requests are capped per provider, and
+capacity snapshots expose active and queued counts. The blocking-tool adapter
+bounds submitted thread work and retains its capacity after caller timeout until
+the underlying thread actually returns. It cannot forcibly terminate Python
+threads.
 
 SQLite is authoritative in one service process. Explicitly serialize transaction
 units, use optimistic state versions, and commit state/events atomically. Never
@@ -63,6 +69,12 @@ Reserve budget before external work, reconcile usage, and retain deadlines acros
 restart/pause. Final prose is only a completion candidate: required actions,
 children, artifacts and acceptance checks must settle first. Memory sharing stays
 within the same user. Artifact access must enforce workspace and symlink bounds.
+
+Built-in file tools operate only under the configured workspace and cannot access
+the artifact storage root or reserved runtime data. They reject
+absolute/traversal paths and symlink/reparse-point components, use bounded
+UTF-8 text, and keep search results capped. File edits replace one exact match
+and fail if it is missing or ambiguous; writes remain non-read-only effects.
 
 Known end-state limits: trusted in-process tools, single-host SQLite ownership,
 non-preemptive operations, uncertain provider usage and no universal exactly-once

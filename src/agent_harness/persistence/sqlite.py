@@ -18,13 +18,21 @@ from agent_harness.domain.model import ModelResponse, Step, StepStatus
 from agent_harness.domain.states import (
     RUN_TRANSITIONS,
     ControlIntent,
+    InvocationStatus,
     RunStatus,
     TaskStatus,
     validate_transition,
 )
+from agent_harness.domain.tooling import Approval, ArtifactRecord, Invocation
 from agent_harness.models.codec import decode_step, encode_step
 from agent_harness.persistence.codec import decode_run, decode_task, encode
 from agent_harness.persistence.migrations import migrate
+from agent_harness.persistence.tool_codec import (
+    decode_artifact,
+    decode_invocation,
+    encode_artifact,
+    encode_invocation,
+)
 from agent_harness.ports.state import Clock, IdGenerator, StateTransaction
 
 
@@ -138,6 +146,184 @@ class SQLiteTransaction:
         self.check_active()
         if user_id != self._user:
             raise HarnessError(ErrorCode.AUTHORIZATION, "Principal does not own this object")
+
+    async def invocations(self, run_id: str) -> tuple[Invocation, ...]:
+        self.check_active()
+        async with self._db.execute(
+            "SELECT snapshot FROM invocations WHERE run_id=? AND user_id=? ORDER BY rowid",
+            (run_id, self._user),
+        ) as cursor:
+            return tuple(decode_invocation(str(row[0])) for row in await cursor.fetchall())
+
+    async def get_invocation(self, invocation_id: str) -> Invocation | None:
+        self.check_active()
+        async with self._db.execute(
+            "SELECT snapshot FROM invocations WHERE invocation_id=? AND user_id=?",
+            (invocation_id, self._user),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return decode_invocation(str(row[0])) if row else None
+
+    @mutation
+    async def save_invocation(
+        self, invocation: Invocation, expected: InvocationStatus | None
+    ) -> None:
+        self._scope(invocation.user_id)
+        previous = await self.get_invocation(invocation.invocation_id)
+        if (previous.status if previous else None) != expected:
+            raise conflict()
+        if previous is None:
+            require(invocation.status == InvocationStatus.PLANNED, "Invocation must start planned")
+            steps = await self.steps(invocation.run_id)
+            require(
+                any(
+                    s.step_id == invocation.step_id
+                    and s.task_id == invocation.task_id
+                    and s.status == StepStatus.ACCEPTED
+                    for s in steps
+                ),
+                "Invocation requires an accepted decision",
+            )
+            await self._db.execute(
+                "INSERT INTO invocations VALUES (?,?,?,?,?,?,?,?)",
+                (
+                    invocation.invocation_id,
+                    invocation.run_id,
+                    invocation.task_id,
+                    invocation.user_id,
+                    invocation.step_id,
+                    invocation.call_id,
+                    invocation.status,
+                    encode_invocation(invocation),
+                ),
+            )
+        else:
+            validate_transition(previous.status, invocation.status)
+            require(
+                replace(
+                    previous,
+                    status=invocation.status,
+                    result=invocation.result,
+                    error=invocation.error,
+                )
+                == invocation,
+                "Invocation identity, arguments and approval binding are immutable",
+            )
+            await self._db.execute(
+                "UPDATE invocations SET status=?,snapshot=? WHERE invocation_id=?",
+                (invocation.status, encode_invocation(invocation), invocation.invocation_id),
+            )
+        await self._event(
+            invocation.run_id,
+            f"invocation.{invocation.status.value}",
+            task_id=invocation.task_id,
+            status=invocation.status,
+        )
+
+    async def get_approval(self, invocation_id: str) -> Approval | None:
+        self.check_active()
+        async with self._db.execute(
+            "SELECT * FROM approvals WHERE invocation_id=? AND user_id=?",
+            (invocation_id, self._user),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return (
+            Approval(
+                str(row[0]),
+                str(row[1]),
+                str(row[2]),
+                str(row[3]),
+                bool(row[4]),
+                datetime.fromisoformat(row[5]),
+            )
+            if row
+            else None
+        )
+
+    @mutation
+    async def save_approval(self, approval: Approval) -> None:
+        self._scope(approval.user_id)
+        invocation = await self.get_invocation(approval.invocation_id)
+        require(invocation is not None, "Invocation unavailable")
+        assert invocation is not None
+        require(
+            invocation.status == InvocationStatus.AWAITING_APPROVAL
+            and invocation.argument_hash == approval.argument_hash
+            and invocation.tool_version == approval.tool_version
+            and invocation.approval_expires_at == approval.expires_at
+            and approval.expires_at > self._clock.utc_now(),
+            "Approval binding is invalid or expired",
+        )
+        await self._db.execute(
+            "INSERT INTO approvals VALUES (?,?,?,?,?,?)",
+            (
+                approval.invocation_id,
+                approval.user_id,
+                approval.tool_version,
+                approval.argument_hash,
+                int(approval.approved),
+                approval.expires_at.isoformat(),
+            ),
+        )
+        await self.save_invocation(
+            replace(
+                invocation,
+                status=InvocationStatus.READY if approval.approved else InvocationStatus.FAILED,
+                error=None
+                if approval.approved
+                else JsonObject('{"code":"authorization","message":"Action denied"}'),
+            ),
+            InvocationStatus.AWAITING_APPROVAL,
+        )
+
+    async def artifacts(self, run_id: str) -> tuple[ArtifactRecord, ...]:
+        self.check_active()
+        async with self._db.execute(
+            "SELECT snapshot FROM artifacts WHERE run_id=? AND user_id=? ORDER BY name,version",
+            (run_id, self._user),
+        ) as cursor:
+            return tuple(decode_artifact(str(row[0])) for row in await cursor.fetchall())
+
+    @mutation
+    async def save_artifact(self, artifact: ArtifactRecord, expected: str | None) -> None:
+        self._scope(artifact.user_id)
+        previous = next(
+            (
+                a
+                for a in await self.artifacts(artifact.run_id)
+                if a.artifact_id == artifact.artifact_id
+            ),
+            None,
+        )
+        if (previous.status if previous else None) != expected:
+            raise conflict()
+        if previous is None:
+            require(artifact.status == "staged", "New manifest must be staged")
+            await self._db.execute(
+                "INSERT INTO artifacts VALUES (?,?,?,?,?,?,?,?)",
+                (
+                    artifact.artifact_id,
+                    artifact.run_id,
+                    artifact.task_id,
+                    artifact.user_id,
+                    artifact.name,
+                    artifact.version,
+                    artifact.status,
+                    encode_artifact(artifact),
+                ),
+            )
+        else:
+            require(
+                previous.status == "staged"
+                and artifact.status == "committed"
+                and replace(previous, status="committed") == artifact,
+                "Invalid manifest transition",
+            )
+            await self._db.execute(
+                "UPDATE artifacts SET status=?,snapshot=? WHERE artifact_id=?",
+                (artifact.status, encode_artifact(artifact), artifact.artifact_id),
+            )
+        await self._event(artifact.run_id, f"artifact.{artifact.status}", task_id=artifact.task_id)
 
     @mutation
     async def create_step(self, step: Step) -> None:

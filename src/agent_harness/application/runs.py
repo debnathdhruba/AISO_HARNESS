@@ -1,8 +1,11 @@
 """Submission and inspection; no transport or provider dependencies."""
 
 import json
+from dataclasses import replace
 from datetime import timedelta
+from pathlib import Path
 
+from agent_harness.application.routing import select_mode
 from agent_harness.domain.entities import JsonObject, Run, RunConfig, Task
 from agent_harness.domain.errors import ErrorCode, HarnessError
 from agent_harness.domain.model import RunOptions
@@ -15,6 +18,12 @@ class RunService:
         self._store, self._clock, self._ids = store, clock, ids
 
     async def submit(self, user_id: str, task_input: str, options: RunOptions) -> Run:
+        options = replace(
+            options,
+            workspace=str(Path(options.workspace).absolute()),
+            artifact_root=str(Path(options.artifact_root).absolute()),
+            routing_mode=select_mode(task_input, options),
+        )
         now = self._clock.utc_now()
         task_id = self._ids.new_id()
         config = RunConfig(

@@ -245,7 +245,7 @@ async def test_migrate_existing_version_one_database(tmp_path: Path, run: Run) -
     with sqlite3.connect(path) as connection:
         assert connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version"
-        ).fetchall() == [(1,), (2,), (3,)]
+        ).fetchall() == [(1,), (2,), (3,), (4,)]
         assert connection.execute("SELECT control_intent FROM runs").fetchone() == ("pause",)
     # Reopen must not apply migration 2 twice.
     async with SQLiteStore(path, FixedClock(), SequenceIds()):
@@ -256,7 +256,9 @@ async def test_future_schema_rejected(tmp_path: Path) -> None:
     path = tmp_path / "future.sqlite"
     with sqlite3.connect(path) as connection:
         connection.execute("CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY)")
-        connection.executemany("INSERT INTO schema_migrations VALUES (?)", [(1,), (2,), (3,), (4,)])
+        connection.executemany(
+            "INSERT INTO schema_migrations VALUES (?)", [(1,), (2,), (3,), (4,), (5,)]
+        )
     with pytest.raises(HarnessError, match="Unsupported database schema"):
         async with SQLiteStore(path, FixedClock(), SequenceIds()):
             pass

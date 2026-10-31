@@ -28,7 +28,11 @@ def test_standalone_import_boundary() -> None:
     requirements = importlib.metadata.requires("agent-harness") or []
     runtime = [requirement for requirement in requirements if "extra ==" not in requirement]
     assert {requirement.split("<")[0].split(">=")[0] for requirement in runtime} == {
-        "aiosqlite", "httpx", "pydantic", "typer"
+        "aiosqlite",
+        "httpx",
+        "pydantic",
+        "typer",
+        "jsonschema",
     }
 
 

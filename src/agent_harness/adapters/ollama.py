@@ -18,7 +18,7 @@ from agent_harness.domain.model import (
     ToolCall,
     Usage,
 )
-from agent_harness.models.context import size
+from agent_harness.models.context import size, tool_schema_size
 
 
 class FunctionPayload(BaseModel):
@@ -140,23 +140,60 @@ class OllamaClient:
                 ) from None
 
     async def generate(self, request: ModelRequest) -> ModelResponse:
-        # Phase 2 supplies no tool registry or tool results. Do not discard them silently.
-        require(
-            all(not m.tool_calls and m.role != Role.TOOL for m in request.messages),
-            "Tool-history transport is not enabled in Phase 2",
-        )
+        if request.model not in self._capabilities:
+            await self.discover((request.model,))
+        if request.tools:
+            require(
+                self.capabilities(request.model).tool_calls, "Selected model does not support tools"
+            )
+        call_names = {c.call_id: c.name for m in request.messages for c in m.tool_calls}
+        messages: list[dict[str, object]] = []
+        for message in request.messages:
+            native: dict[str, object] = {"role": message.role.value, "content": message.content}
+            if message.tool_calls:
+                native["tool_calls"] = [
+                    {
+                        "id": c.call_id,
+                        "type": "function",
+                        "function": {"name": c.name, "arguments": json.loads(c.arguments.text)},
+                    }
+                    for c in message.tool_calls
+                ]
+            if message.role == Role.TOOL:
+                require(message.tool_call_id in call_names, "Tool result has no matching request")
+                assert message.tool_call_id is not None
+                native["tool_name"] = call_names[message.tool_call_id]
+                native["tool_call_id"] = message.tool_call_id
+            messages.append(native)
+        extra: dict[str, object] = {}
+        if request.tools:
+            extra["tools"] = [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": spec.name,
+                        "description": spec.description,
+                        "parameters": json.loads(spec.input_schema.text),
+                    },
+                }
+                for spec in request.tools
+            ]
         raw = await self._post(
             "/api/chat",
             {
                 "model": request.model,
-                "messages": [
-                    {"role": m.role.value, "content": m.content} for m in request.messages
-                ],
+                "messages": messages,
+                **extra,
                 "stream": False,
                 "options": {
-                    "temperature": 0,
                     "num_predict": request.max_output_tokens,
-                    "num_ctx": max(2048, size(request.messages) + request.max_output_tokens + 512),
+                    "num_ctx": max(
+                        2048,
+                        size(request.messages)
+                        + tool_schema_size(request.tools)
+                        + request.max_output_tokens
+                        + 512,
+                    ),
                 },
                 "keep_alive": "5m",
             },

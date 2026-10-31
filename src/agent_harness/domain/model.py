@@ -6,6 +6,7 @@ from enum import StrEnum
 
 from agent_harness.domain.entities import JsonObject, identifier
 from agent_harness.domain.errors import require
+from agent_harness.domain.tooling import ToolSpec
 
 
 class Role(StrEnum):
@@ -86,6 +87,7 @@ class ModelRequest:
     model: str
     messages: tuple[Message, ...]
     max_output_tokens: int
+    tools: tuple[ToolSpec, ...] = ()
 
     def __post_init__(self) -> None:
         identifier(self.request_id)
@@ -132,13 +134,36 @@ class RunOptions:
     provider: str = "fake"
     decision_model: str = "lfm2.5-thinking:1.2b"
     response_model: str = "gemma3:1b"
-    max_steps: int = 2
+    max_steps: int = 8
     timeout_seconds: int = 180
     max_output_tokens: int = 1024
     max_input_bytes: int = 16384
+    tool_allowlist: tuple[str, ...] = (
+        "calculator",
+        "artifact_write",
+        "artifact_read",
+        "artifact_list",
+        "read_file",
+        "write_file",
+        "search_files",
+        "edit_file",
+    )
+    max_tool_calls: int = 8
+    repeated_action_limit: int = 2
+    require_write_approval: bool = False
+    workspace: str = "."
+    artifact_root: str = ".local/artifacts"
+    required_tools: tuple[str, ...] = ()
+    routing_mode: str = "auto"
+    response_max_tokens: int = 512
 
     def __post_init__(self) -> None:
         require(self.provider in {"fake", "ollama"}, "Unsupported provider")
+        require(self.routing_mode in {"auto", "chat", "tools", "two_stage"}, "Invalid routing mode")
+        require(1 <= self.response_max_tokens <= 8192, "Invalid response token limit")
+        require(
+            set(self.required_tools) <= set(self.tool_allowlist), "Required tools must be permitted"
+        )
         require(
             bool(self.decision_model.strip() and self.response_model.strip()), "Models required"
         )
@@ -146,10 +171,20 @@ class RunOptions:
         require(1 <= self.timeout_seconds <= 3600, "Timeout must be 1..3600 seconds")
         require(1 <= self.max_output_tokens <= 8192, "Output limit must be 1..8192 tokens")
         require(256 <= self.max_input_bytes <= 131072, "Input limit must be 256..131072 bytes")
+        require(
+            1 <= self.max_tool_calls <= 100 and 1 <= self.repeated_action_limit <= 10,
+            "Invalid tool call limits",
+        )
 
     def snapshot(self) -> JsonObject:
         return JsonObject(json.dumps(asdict(self)))
 
     @classmethod
     def restore(cls, snapshot: JsonObject) -> "RunOptions":
-        return cls(**json.loads(snapshot.text))
+        data = json.loads(snapshot.text)
+        # Legacy Phase 2 runs had no tool authorization. Do not grant capabilities on resume.
+        data["tool_allowlist"] = tuple(data.get("tool_allowlist", ()))
+        data["required_tools"] = tuple(data.get("required_tools", ()))
+        data.setdefault("artifact_root", data.get("workspace", ".local/artifacts"))
+        data.setdefault("routing_mode", "two_stage")
+        return cls(**data)

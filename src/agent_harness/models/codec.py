@@ -17,6 +17,7 @@ from agent_harness.domain.model import (
     ToolCall,
     Usage,
 )
+from agent_harness.domain.tooling import Effect, ToolSpec
 
 
 def encode_step(step: Step) -> str:
@@ -43,11 +44,18 @@ def decode_step(text: str) -> Step:
         require(snapshot["schema_version"] == 1, "Unsupported step schema version")
         data = snapshot["data"]
         request = data["request"]
+        tools = []
+        for raw in request.get("tools", []):
+            raw["input_schema"] = JsonObject(**raw["input_schema"])
+            raw["output_schema"] = JsonObject(**raw["output_schema"])
+            raw["effect"] = Effect(raw["effect"])
+            tools.append(ToolSpec(**raw))
         data["request"] = ModelRequest(
             request["request_id"],
             request["model"],
             tuple(decode_message(m) for m in request["messages"]),
             request["max_output_tokens"],
+            tuple(tools),
         )
         response = data["response"]
         if response is not None:

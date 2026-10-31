@@ -15,6 +15,7 @@ async def demonstrate(path: Path) -> None:
     now = clock.utc_now()
     run = Run(ids.new_id(), "local-user", "Inspect durable state", RunConfig("demo", "1"), now, now)
     task = Task(ids.new_id(), run.run_id, run.user_id, run.task_input, now, now)
+    path.parent.mkdir(parents=True, exist_ok=True)
     async with SQLiteStore(path, clock, ids) as store:
         async with store.transaction(run.user_id) as tx:
             await tx.create_run(run)
@@ -47,6 +48,6 @@ async def demonstrate(path: Path) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--database", type=Path, required=True)
+    parser.add_argument("--database", type=Path, default=Path(".local/harness.sqlite"))
     args = parser.parse_args()
     asyncio.run(demonstrate(args.database))
