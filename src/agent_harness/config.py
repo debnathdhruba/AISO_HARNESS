@@ -34,7 +34,9 @@ class Settings(BaseModel):
         "artifact_write",
         "artifact_read",
         "artifact_list",
+        "list_files",
         "read_file",
+        "read_file_range",
         "write_file",
         "search_files",
         "edit_file",
@@ -63,7 +65,7 @@ class Settings(BaseModel):
     memory_context_bytes: int = Field(default=2048, ge=128, le=16384)
     model_concurrency: int = Field(default=2, ge=1, le=32)
     model_queue_capacity: int = Field(default=8, ge=0, le=1024)
-    model_provider_concurrency: int = Field(default=1, ge=1, le=32)
+    model_provider_concurrency: int = Field(default=2, ge=1, le=32)
     tool_concurrency: int = Field(default=4, ge=1, le=64)
     tool_queue_capacity: int = Field(default=16, ge=0, le=1024)
     artifact_concurrency: int = Field(default=2, ge=1, le=32)

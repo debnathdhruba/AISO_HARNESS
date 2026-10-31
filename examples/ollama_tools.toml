@@ -11,17 +11,21 @@ tool_allowlist = [
     "calculator",
     "artifact_write",
     "artifact_read",
+    "artifact_list",
+    "list_files",
     "read_file",
+    "read_file_range",
     "write_file",
     "search_files",
     "edit_file",
+    "delegate_tasks",
 ]
 required_tools = ["calculator", "artifact_write", "artifact_read"]
 routing_mode = "tools"
 response_max_tokens = 512
 model_concurrency = 2
 model_queue_capacity = 8
-model_provider_concurrency = 1
+model_provider_concurrency = 2
 tool_concurrency = 4
 tool_queue_capacity = 16
 artifact_concurrency = 2

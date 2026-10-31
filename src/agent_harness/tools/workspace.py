@@ -159,6 +159,59 @@ class WorkspaceFileService:
         content = self._read_text(target, self._max_file_bytes)
         return JsonObject(json.dumps({"path": relative, "content": content}))
 
+    def read_range(self, relative: str, start_line: int, line_count: int) -> JsonObject:
+        require(start_line >= 1, "File range start line must be positive")
+        require(1 <= line_count <= 100, "File range line count must be 1..100")
+        target = self._path(relative)
+        try:
+            info = target.lstat()
+            require(stat.S_ISREG(info.st_mode), "Workspace path is not a regular file")
+            lines: list[dict[str, str | int]] = []
+            scanned_bytes = 0
+            content_bytes = 0
+            line_number = 0
+            truncated = False
+            with target.open("rb") as stream:
+                while line_number < start_line + line_count - 1:
+                    raw = stream.readline(65_537)
+                    if not raw:
+                        break
+                    require(len(raw) <= 65_536, "Workspace line exceeds the range-read limit")
+                    scanned_bytes += len(raw)
+                    require(
+                        scanned_bytes <= 2_097_152,
+                        "File range scan exceeds the 2 MiB limit",
+                    )
+                    line_number += 1
+                    if line_number < start_line:
+                        continue
+                    text = raw.decode("utf-8").rstrip("\r\n")
+                    encoded = text.encode("utf-8")
+                    remaining = 12_000 - content_bytes
+                    if len(encoded) > remaining:
+                        text = encoded[:remaining].decode("utf-8", errors="ignore")
+                        truncated = True
+                    lines.append({"line": line_number, "text": text})
+                    content_bytes += len(text.encode("utf-8"))
+                    if truncated or content_bytes >= 12_000:
+                        break
+        except (OSError, UnicodeError):
+            raise HarnessError(
+                ErrorCode.STORAGE, "Cannot read UTF-8 workspace file range"
+            ) from None
+        return JsonObject(
+            json.dumps(
+                {
+                    "path": relative,
+                    "start_line": start_line,
+                    "end_line": lines[-1]["line"] if lines else None,
+                    "lines": lines,
+                    "truncated": truncated,
+                    "scanned_bytes": scanned_bytes,
+                }
+            )
+        )
+
     async def write(self, invocation: Invocation, relative: str, content: str) -> JsonObject:
         size = self._write_text(invocation, relative, content)
         return JsonObject(json.dumps({"path": relative, "bytes_written": size}))
@@ -272,6 +325,58 @@ class WorkspaceFileService:
             if truncated:
                 break
         return result_payload()
+
+    def list_files(self, directory: str, pattern: str = "*", limit: int = 100) -> JsonObject:
+        require(bool(pattern) and len(pattern) <= 200, "Invalid file listing pattern")
+        require(1 <= limit <= 200, "File listing limit must be 1..200")
+        target = self._path(directory or ".")
+        require(target.is_dir(), "Workspace listing path is not a directory")
+        entries: list[dict[str, str | int]] = []
+        scanned = 0
+        truncated = False
+        try:
+            with os.scandir(target) as iterator:
+                for entry in iterator:
+                    scanned += 1
+                    if scanned > 2000:
+                        truncated = True
+                        break
+                    if not fnmatch.fnmatchcase(entry.name, pattern):
+                        continue
+                    candidate = Path(entry.path)
+                    if self._is_link_or_reparse(candidate):
+                        continue
+                    if self._is_artifact_path(candidate):
+                        continue
+                    is_directory = entry.is_dir(follow_symlinks=False)
+                    if is_directory and entry.name.casefold() in _IGNORED_DIRECTORIES:
+                        continue
+                    info = entry.stat(follow_symlinks=False)
+                    if not is_directory and not stat.S_ISREG(info.st_mode):
+                        continue
+                    if len(entries) >= limit:
+                        truncated = True
+                        break
+                    entries.append(
+                        {
+                            "name": entry.name,
+                            "type": "directory" if is_directory else "file",
+                            "size_bytes": 0 if is_directory else info.st_size,
+                        }
+                    )
+        except OSError:
+            raise HarnessError(ErrorCode.STORAGE, "Cannot list workspace directory") from None
+        entries.sort(key=lambda item: str(item["name"]).casefold())
+        payload = {
+            "directory": directory or ".",
+            "entries": entries,
+            "scanned_entries": min(scanned, 2000),
+            "truncated": truncated,
+        }
+        while len(json.dumps(payload).encode("utf-8")) > 30_000 and entries:
+            entries.pop()
+            payload["truncated"] = True
+        return JsonObject(json.dumps(payload))
 
     @staticmethod
     def _is_link_or_reparse(path: Path) -> bool:

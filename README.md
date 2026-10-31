@@ -36,8 +36,14 @@ two_stage` retains the older draft flow. Offline fake-provider `auto` mode
 continues to use deterministic local routing. The resolved route is saved in
 the run; old runs keep their original behavior.
 
-The default tool set includes `read_file`, `write_file`, `search_files`, and
-`edit_file` in addition to calculator and artifact tools. File operations use
+The default tool set includes `list_files`, `read_file`, `write_file`,
+`search_files`, and `edit_file` in addition to calculator and artifact tools.
+`list_files` inspects one workspace directory (not recursively), with bounded
+results and generated-directory filtering. `read_file_range` retrieves up to
+100 lines without placing a whole large file in context; scanning is capped at
+2 MiB and returned text at 12 KiB. The expanded delegation contract is
+versioned; existing persisted `delegate_tasks` v1 calls remain executable.
+File operations use
 the configured `--workspace` directory (default `.`), not the process's
 unrestricted filesystem. Artifact storage has its own root (default
 `.local/artifacts`, configurable with `artifact_root`) and is not exposed through
@@ -119,17 +125,25 @@ use until that thread actually finishes.
 ## Agent delegation (Phase 5)
 
 Runs use the versioned local `coordinator` agent definition. It can delegate a
-bounded batch to the registered `researcher`, `writer`, or bounded
-`coordinator` definitions through `delegate_tasks`. Child objectives,
+bounded batch of task-focused `worker` agents through `delegate_tasks`; these
+agents are created by the factory for delegated tasks, not mapped one-to-one
+with tools. Long, multi-part, or context-heavy tasks should be split into small
+independent subtasks, with independent work submitted together for parallel
+execution. Simple tasks stay with the coordinator. Existing `researcher`,
+`writer`, and nested `coordinator` definitions remain registered so older
+persisted tasks can resume; new delegation requests use generic workers. Child objectives,
 capability subsets, acceptance criteria, artifact IDs, dependencies, and
 idempotency keys are persisted with their task records. Children inherit the
 same user and run deadline; requested tools and step limits can only narrow the
 parent's permissions and limits.
 
 Independent ready children may run concurrently, while dependencies execute in
-order. The task scheduler admits work round-robin across runs and FIFO within a
-run; `task_concurrency` and `task_queue_capacity` set its bounds. Defaults cap
-delegation depth, each agent's child count, and each run at 16 children. The
+order. The coordinator permits up to four active children; the task scheduler
+and model-resource/provider concurrency settings impose the actual global
+bounds. The scheduler admits work round-robin across runs and FIFO within a run;
+`task_concurrency`, `task_queue_capacity`, and `model_provider_concurrency`
+configure those bounds. The default Ollama provider concurrency is two. Defaults
+cap delegation depth, each agent's child count, and each run at 16 children. The
 default child-failure behavior is fail-fast; set
 `partial_result_policy = "allow"` to continue independent children and permit a
 partial parent result. Child results, failures, and artifact references return

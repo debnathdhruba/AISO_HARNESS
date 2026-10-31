@@ -18,7 +18,8 @@ def select_mode(task: str, options: RunOptions) -> str:
         return "router_worker"
     text = task.lower().strip()
     explicit = re.search(
-        r"\b(calculator|artifact_(write|read|list)|(read|write|search|edit)_file|artifact demo)\b",
+        r"\b(calculator|artifact_(write|read|list)|list_files|read_file_range|"
+        r"(read|write|search|edit)_file|artifact demo)\b",
         text,
     )
     command = re.sub(r"^(please\s+|(?:can|could|would) you\s+)", "", text)

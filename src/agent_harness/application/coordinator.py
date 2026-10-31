@@ -146,7 +146,11 @@ class TaskCoordinator:
                     or parent.depth + 1 < definition.max_depth,
                     "Delegation depth limit prevents another coordinator",
                 )
-                requested_capabilities = set(spec.capabilities or child_definition.capabilities)
+                requested_capabilities = (
+                    set(spec.capabilities)
+                    if spec.capabilities
+                    else set(child_definition.capabilities) & set(parent_instance.capabilities)
+                )
                 require(
                     requested_capabilities <= set(child_definition.capabilities)
                     and requested_capabilities <= set(parent_instance.capabilities),

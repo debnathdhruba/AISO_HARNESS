@@ -91,41 +91,45 @@ class AgentFactory:
 
 
 def local_agent_registry() -> AgentRegistry:
-    file_tools = ("read_file", "search_files")
+    file_tools = ("list_files", "read_file", "read_file_range", "search_files")
     artifacts = ("artifact_write", "artifact_read", "artifact_list")
+    worker_capabilities = (
+        "calculator",
+        *artifacts,
+        *file_tools,
+        "write_file",
+        "edit_file",
+        "memory_save",
+    )
     return AgentRegistry(
         (
             AgentDefinition(
                 "single-agent",
                 "1",
-                (
-                    "calculator",
-                    *artifacts,
-                    *file_tools,
-                    "write_file",
-                    "edit_file",
-                    "memory_save",
-                ),
+                worker_capabilities,
                 "Complete the assigned task using only authorized local capabilities.",
             ),
             AgentDefinition(
                 "coordinator",
                 "1",
-                (
-                    "calculator",
-                    *artifacts,
-                    *file_tools,
-                    "write_file",
-                    "edit_file",
-                    "memory_save",
-                    "delegate_tasks",
-                ),
-                "Coordinate bounded child agents when useful. Delegate only explicit objectives, "
-                "then base your final result on their structured results.",
+                (*worker_capabilities, "delegate_tasks"),
+                "Coordinate the task. For long, context-heavy, or multi-part work, split it into "
+                "small, independently verifiable tasks and delegate them to task-focused worker "
+                "agents. Delegate independent tasks together so they can run in parallel; add "
+                "dependencies only when one task truly needs another's result. Keep simple tasks "
+                "local. Recombine worker results and verify the final answer.",
                 may_delegate=True,
                 max_children=8,
-                max_active_children=2,
+                max_active_children=4,
                 max_depth=2,
+            ),
+            AgentDefinition(
+                "worker",
+                "1",
+                worker_capabilities,
+                "Complete the explicit bounded subtask using only the supplied handoff and "
+                "authorized capabilities. Return concise findings with file paths or artifact IDs "
+                "when available. Do not delegate further.",
             ),
             AgentDefinition(
                 "researcher",

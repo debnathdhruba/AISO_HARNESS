@@ -27,6 +27,53 @@ def schema(properties: dict[str, object], required: list[str]) -> JsonObject:
     )
 
 
+def delegation_schema(agent_profiles: tuple[str, ...]) -> JsonObject:
+    return schema(
+        {
+            "tasks": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 8,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "alias": {"type": "string", "minLength": 1, "maxLength": 64},
+                        "idempotency_key": {"type": "string", "minLength": 1, "maxLength": 200},
+                        "agent_definition_id": {"type": "string", "enum": list(agent_profiles)},
+                        "agent_version": {"type": "string", "maxLength": 20},
+                        "objective": {"type": "string", "minLength": 1, "maxLength": 4096},
+                        "acceptance_criteria": {"type": "object"},
+                        "input_artifact_ids": {
+                            "type": "array",
+                            "items": {"type": "string", "maxLength": 64},
+                            "maxItems": 16,
+                        },
+                        "dependencies": {
+                            "type": "array",
+                            "items": {"type": "string", "maxLength": 64},
+                            "maxItems": 8,
+                        },
+                        "capabilities": {
+                            "type": "array",
+                            "items": {"type": "string", "maxLength": 64},
+                            "maxItems": 16,
+                        },
+                        "max_steps": {"type": "integer", "minimum": 1, "maximum": 100},
+                    },
+                    "required": [
+                        "alias",
+                        "idempotency_key",
+                        "agent_definition_id",
+                        "objective",
+                    ],
+                    "additionalProperties": False,
+                },
+            }
+        },
+        ["tasks"],
+    )
+
+
 def calculate(expression: str) -> int | float:
     require(len(expression) <= 200, "Calculator expression too long")
     try:
@@ -96,6 +143,18 @@ def builtin_registry(
         args = json.loads(invocation.arguments.text)
         return await files.read(invocation, args["path"])
 
+    async def read_file_range(invocation: Invocation) -> JsonObject:
+        args = json.loads(invocation.arguments.text)
+        return files.read_range(args["path"], args["start_line"], args["line_count"])
+
+    async def list_files(invocation: Invocation) -> JsonObject:
+        args = json.loads(invocation.arguments.text)
+        return files.list_files(
+            args["directory"],
+            args.get("pattern", "*"),
+            args.get("limit", 100),
+        )
+
     async def write_file(invocation: Invocation) -> JsonObject:
         args = json.loads(invocation.arguments.text)
         return await files.write(invocation, args["path"], args["content"])
@@ -155,6 +214,49 @@ def builtin_registry(
         RegisteredTool(
             ToolSpec("artifact_list", "1", "List artifacts in this task.", schema({}, []), output),
             listing,
+        ),
+        RegisteredTool(
+            ToolSpec(
+                "read_file_range",
+                "1",
+                "Read a bounded line range from a UTF-8 workspace file. Use this instead of "
+                "reading an entire large file when only part is relevant.",
+                schema(
+                    {
+                        "path": {"type": "string", "maxLength": 512},
+                        "start_line": {"type": "integer", "minimum": 1},
+                        "line_count": {"type": "integer", "minimum": 1, "maximum": 100},
+                    },
+                    ["path", "start_line", "line_count"],
+                ),
+                output,
+                max_output_bytes=32_768,
+            ),
+            read_file_range,
+        ),
+        RegisteredTool(
+            ToolSpec(
+                "list_files",
+                "1",
+                "List bounded files and directories directly inside a workspace directory. "
+                "Use '.' for the workspace root; this does not recurse.",
+                schema(
+                    {
+                        "directory": {"type": "string", "maxLength": 512},
+                        "pattern": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 200,
+                            "default": "*",
+                        },
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 100},
+                    },
+                    ["directory"],
+                ),
+                output,
+                max_output_bytes=32_768,
+            ),
+            list_files,
         ),
         RegisteredTool(
             ToolSpec(
@@ -221,82 +323,38 @@ def builtin_registry(
         ),
     ]
     if delegate is not None:
-        tools.append(
-            RegisteredTool(
-                ToolSpec(
-                    "delegate_tasks",
-                    "1",
-                    "Delegate a bounded batch of explicit tasks to registered child agents. "
-                    "Dependencies use aliases from this batch.",
-                    schema(
-                        {
-                            "tasks": {
-                                "type": "array",
-                                "minItems": 1,
-                                "maxItems": 8,
-                                "items": {
-                                    "type": "object",
-                                    "properties": {
-                                        "alias": {
-                                            "type": "string",
-                                            "minLength": 1,
-                                            "maxLength": 64,
-                                        },
-                                        "idempotency_key": {
-                                            "type": "string",
-                                            "minLength": 1,
-                                            "maxLength": 200,
-                                        },
-                                        "agent_definition_id": {
-                                            "type": "string",
-                                            "enum": ["coordinator", "researcher", "writer"],
-                                        },
-                                        "agent_version": {"type": "string", "maxLength": 20},
-                                        "objective": {
-                                            "type": "string",
-                                            "minLength": 1,
-                                            "maxLength": 4096,
-                                        },
-                                        "acceptance_criteria": {"type": "object"},
-                                        "input_artifact_ids": {
-                                            "type": "array",
-                                            "items": {"type": "string", "maxLength": 64},
-                                            "maxItems": 16,
-                                        },
-                                        "dependencies": {
-                                            "type": "array",
-                                            "items": {"type": "string", "maxLength": 64},
-                                            "maxItems": 8,
-                                        },
-                                        "capabilities": {
-                                            "type": "array",
-                                            "items": {"type": "string", "maxLength": 64},
-                                            "maxItems": 16,
-                                        },
-                                        "max_steps": {
-                                            "type": "integer",
-                                            "minimum": 1,
-                                            "maximum": 100,
-                                        },
-                                    },
-                                    "required": [
-                                        "alias",
-                                        "idempotency_key",
-                                        "agent_definition_id",
-                                        "objective",
-                                    ],
-                                    "additionalProperties": False,
-                                },
-                            }
-                        },
-                        ["tasks"],
+        tools.extend(
+            (
+                RegisteredTool(
+                    ToolSpec(
+                        "delegate_tasks",
+                        "1",
+                        "Delegate a bounded batch of explicit tasks to registered child agents. "
+                        "Dependencies use aliases from this batch.",
+                        delegation_schema(("coordinator", "researcher", "writer")),
+                        output,
+                        effect=Effect.IDEMPOTENT_WRITE,
+                        idempotency="invocation_id",
+                        supports_reconciliation=True,
                     ),
-                    output,
-                    effect=Effect.IDEMPOTENT_WRITE,
-                    idempotency="invocation_id",
-                    supports_reconciliation=True,
+                    delegate,
                 ),
-                delegate,
+                RegisteredTool(
+                    ToolSpec(
+                        "delegate_tasks",
+                        "2",
+                        "Delegate a bounded batch of tasks to task-focused worker agents. Use for "
+                        "substantial, multi-part, or context-heavy work; put independent tasks in "
+                        "one batch for parallel execution. Dependencies use aliases from this "
+                        "batch.",
+                        delegation_schema(("worker",)),
+                        output,
+                        effect=Effect.IDEMPOTENT_WRITE,
+                        idempotency="invocation_id",
+                        supports_reconciliation=True,
+                    ),
+                    delegate,
+                ),
             )
         )
     if memory_save is not None:

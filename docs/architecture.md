@@ -61,6 +61,11 @@ Gemma routes using the full task context without native tool schemas, then LFM
 generates a single selected tool call from compact routed data and that tool's
 schema. Each model request remains an independent persisted step; tool policy,
 execution, and result validation stay in the existing runner and tool executor.
+The versioned `worker` agent definition is task-focused rather than paired with
+an individual tool. Coordinators can create bounded worker tasks through the
+factory/coordinator path; independent children run concurrently within the
+configured task and model-provider limits. `delegate_tasks` retains its v1
+contract for persisted calls and exposes the worker profile through v2.
 Phase 4 implements in-process model, tool, artifact and memory admission lanes:
 queues reject excess work explicitly, model requests are capped per provider, and
 capacity snapshots expose active and queued counts. The blocking-tool adapter
@@ -84,8 +89,10 @@ within the same user. Artifact access must enforce workspace and symlink bounds.
 Built-in file tools operate only under the configured workspace and cannot access
 the artifact storage root or reserved runtime data. They reject
 absolute/traversal paths and symlink/reparse-point components, use bounded
-UTF-8 text, and keep search results capped. File edits replace one exact match
-and fail if it is missing or ambiguous; writes remain non-read-only effects.
+UTF-8 text, and keep search results capped. Directory listing is non-recursive
+and bounded; range reads cap both scanned and returned bytes to reduce context
+pressure. File edits replace one exact match and fail if it is missing or
+ambiguous; writes remain non-read-only effects.
 
 Known end-state limits: trusted in-process tools, single-service ownership,
 non-preemptive operations, uncertain provider usage and no universal exactly-once

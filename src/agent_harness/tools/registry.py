@@ -28,9 +28,12 @@ class RegisteredTool:
 
 class ToolRegistry:
     def __init__(self, tools: tuple[RegisteredTool, ...]) -> None:
-        require(len({t.spec.name for t in tools}) == len(tools), "Duplicate registered tool name")
-        self._tools = {tool.spec.name: tool for tool in tools}
+        keys = {(tool.spec.name, tool.spec.version) for tool in tools}
+        require(len(keys) == len(tools), "Duplicate registered tool version")
+        self._tools = {(tool.spec.name, tool.spec.version): tool for tool in tools}
+        self._latest: dict[str, RegisteredTool] = {}
         for tool in tools:
+            self._latest[tool.spec.name] = tool
             for schema in (tool.spec.input_schema, tool.spec.output_schema):
                 parsed = json.loads(schema.text)
                 # Schemas are trusted, local and cannot fetch remote references.
@@ -38,8 +41,8 @@ class ToolRegistry:
                 Draft202012Validator.check_schema(parsed)
 
     def get(self, name: str, version: str | None = None) -> RegisteredTool:
-        tool = self._tools.get(name)
-        if tool is None or (version is not None and tool.spec.version != version):
+        tool = self._tools.get((name, version)) if version is not None else self._latest.get(name)
+        if tool is None:
             raise HarnessError(ErrorCode.AUTHORIZATION, "Tool/version is not registered")
         return tool
 
