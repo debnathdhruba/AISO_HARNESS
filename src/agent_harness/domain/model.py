@@ -157,11 +157,37 @@ class RunOptions:
     required_tools: tuple[str, ...] = ()
     routing_mode: str = "auto"
     response_max_tokens: int = 512
+    max_total_steps: int = 256
+    max_total_tokens: int = 262144
+    max_total_tool_calls: int = 128
+    retry_strategy: str = "none"
+    max_retries: int = 0
+    max_corrections: int = 1
+    partial_result_policy: str = "fail"
+    required_artifacts: tuple[str, ...] = ()
+    result_schema: JsonObject = JsonObject()
 
     def __post_init__(self) -> None:
         require(self.provider in {"fake", "ollama"}, "Unsupported provider")
         require(self.routing_mode in {"auto", "chat", "tools", "two_stage"}, "Invalid routing mode")
         require(1 <= self.response_max_tokens <= 8192, "Invalid response token limit")
+        require(
+            1 <= self.max_total_steps <= 4096
+            and 1 <= self.max_total_tokens <= 10_000_000
+            and 1 <= self.max_total_tool_calls <= 4096,
+            "Invalid hierarchical budget limits",
+        )
+        require(self.retry_strategy in {"none", "transient_provider"}, "Invalid retry strategy")
+        require(0 <= self.max_retries <= 3, "Retry limit must be 0..3")
+        require(0 <= self.max_corrections <= 3, "Correction limit must be 0..3")
+        require(
+            self.partial_result_policy in {"fail", "allow"},
+            "Invalid partial-result policy",
+        )
+        require(
+            all(bool(name.strip()) for name in self.required_artifacts),
+            "Required artifact names cannot be empty",
+        )
         require(
             set(self.required_tools) <= set(self.tool_allowlist), "Required tools must be permitted"
         )
@@ -186,6 +212,15 @@ class RunOptions:
         # Legacy Phase 2 runs had no tool authorization. Do not grant capabilities on resume.
         data["tool_allowlist"] = tuple(data.get("tool_allowlist", ()))
         data["required_tools"] = tuple(data.get("required_tools", ()))
+        data["required_artifacts"] = tuple(data.get("required_artifacts", ()))
+        data["result_schema"] = JsonObject(**data.get("result_schema", {"text": "{}"}))
         data.setdefault("artifact_root", data.get("workspace", ".local/artifacts"))
         data.setdefault("routing_mode", "two_stage")
+        data.setdefault("max_total_steps", max(data.get("max_steps", 8), 256))
+        data.setdefault("max_total_tokens", 262144)
+        data.setdefault("max_total_tool_calls", 128)
+        data.setdefault("retry_strategy", "none")
+        data.setdefault("max_retries", 0)
+        data.setdefault("max_corrections", 1)
+        data.setdefault("partial_result_policy", "fail")
         return cls(**data)

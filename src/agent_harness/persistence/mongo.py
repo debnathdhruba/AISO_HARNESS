@@ -13,6 +13,7 @@ from pymongo import ASCENDING, DESCENDING, AsyncMongoClient
 from pymongo.asynchronous.client_session import AsyncClientSession
 from pymongo.errors import PyMongoError
 
+from agent_harness.domain.budgets import BudgetLimits, BudgetSnapshot, BudgetUsage
 from agent_harness.domain.entities import Checkpoint, Event, JsonObject, Run, Task
 from agent_harness.domain.errors import ErrorCode, HarnessError, require
 from agent_harness.domain.model import ModelResponse, Step, StepStatus
@@ -214,6 +215,15 @@ class MongoStore:
                 ("parent_task_id", ASCENDING),
                 ("idempotency_key", ASCENDING),
             ),
+            "budget_reservations": (
+                ("run_id", ASCENDING),
+                ("task_id", ASCENDING),
+                ("status", ASCENDING),
+            ),
+            "budget_accounts": (
+                ("run_id", ASCENDING),
+                ("user_id", ASCENDING),
+            ),
         }
         for collection_name, keys in definitions.items():
             collection = self._database[collection_name]
@@ -241,6 +251,10 @@ class MongoStore:
         ):
             await self._database[collection_name].create_index(field, unique=True)
         await self._database["delegations"].create_index("child_task_id", unique=True)
+        await self._database["budget_accounts"].create_index("task_id", unique=True)
+        await self._database["budget_reservations"].create_index(
+            "reservation_id", unique=True
+        )
 
     @asynccontextmanager
     async def transaction(self, user_id: str) -> AsyncGenerator[StateTransaction, None]:
@@ -325,6 +339,233 @@ class MongoTransaction:
         if limit is not None:
             cursor = cursor.limit(limit)
         return [item async for item in cursor]
+
+    async def _task_ancestors(self, task_id: str) -> tuple[Task, ...]:
+        current = await self.get_task(task_id)
+        require(current is not None, "Budget task is unavailable")
+        chain: list[Task] = []
+        seen: set[str] = set()
+        while current is not None:
+            require(current.task_id not in seen, "Task ancestry contains a cycle")
+            seen.add(current.task_id)
+            chain.append(current)
+            if current.parent_task_id is None:
+                break
+            current = await self.get_task(current.parent_task_id)
+            require(
+                current is not None and current.run_id == chain[0].run_id,
+                "Budget ancestry crosses a run boundary",
+            )
+        return tuple(chain)
+
+    async def _ensure_budget_account(self, task: Task) -> Document:
+        row: Document | None = await self._collection("budget_accounts").find_one(
+            {"task_id": task.task_id, "user_id": self._user},
+            session=self._session,
+        )
+        if row is not None:
+            return row
+        run = await self.get_run(task.run_id)
+        require(run is not None, "Budget run is unavailable")
+        assert run is not None
+        configured = json.loads(run.config.budgets.text)
+        if task.parent_task_id is None:
+            limits = BudgetLimits(
+                int(configured.get("max_total_steps", configured.get("max_steps", 8))),
+                int(configured.get("max_total_tokens", 262144)),
+                int(configured.get("max_total_tool_calls", 128)),
+            )
+        else:
+            parent_row = await self._collection("budget_accounts").find_one(
+                {"task_id": task.parent_task_id, "user_id": self._user},
+                session=self._session,
+            )
+            parent_limits = (
+                BudgetLimits(**parent_row["limits"])
+                if parent_row is not None
+                else BudgetLimits(
+                    int(configured.get("max_total_steps", configured.get("max_steps", 8))),
+                    int(configured.get("max_total_tokens", 262144)),
+                    int(configured.get("max_total_tool_calls", 128)),
+                )
+            )
+            requested_steps = int(
+                json.loads(task.handoff.text).get("max_steps", parent_limits.steps)
+            )
+            limits = BudgetLimits(
+                min(requested_steps, parent_limits.steps),
+                parent_limits.tokens,
+                parent_limits.tool_calls,
+            )
+        document = {
+            "_id": task.task_id,
+            "task_id": task.task_id,
+            "run_id": task.run_id,
+            "user_id": task.user_id,
+            "limits": limits.document(),
+            "used": {"steps": 0, "tokens": 0, "tool_calls": 0},
+            "reserved": {"steps": 0, "tokens": 0, "tool_calls": 0},
+            "unknown_usage_count": 0,
+        }
+        await self._collection("budget_accounts").insert_one(
+            document, session=self._session
+        )
+        return document
+
+    @mutation
+    async def reserve_budget(
+        self, reservation_id: str, task_id: str, amount: BudgetUsage
+    ) -> None:
+        self.check_active()
+        requested = amount.reservation()
+        existing = await self._collection("budget_reservations").find_one(
+            {"reservation_id": reservation_id, "user_id": self._user},
+            session=self._session,
+        )
+        if existing is not None:
+            require(
+                existing["task_id"] == task_id and existing["reserved"] == requested,
+                "Budget reservation ID was reused with different work",
+            )
+            return
+        task = await self.get_task(task_id)
+        require(task is not None, "Budget task is unavailable")
+        assert task is not None
+        ancestors = await self._task_ancestors(task_id)
+        account_ids = tuple(item.task_id for item in ancestors)
+        for ancestor in ancestors:
+            account = await self._ensure_budget_account(ancestor)
+            limits = account["limits"]
+            used = account["used"]
+            reserved = account["reserved"]
+            if any(
+                int(used[key]) + int(reserved[key]) + requested[key] > int(limits[key])
+                for key in requested
+            ):
+                raise HarnessError(
+                    ErrorCode.BUDGET_EXCEEDED,
+                    "Hierarchical run budget exhausted",
+                )
+            increments = {f"reserved.{key}": value for key, value in requested.items()}
+            result = await self._collection("budget_accounts").update_one(
+                {"task_id": ancestor.task_id, "user_id": self._user},
+                {"$inc": increments},
+                session=self._session,
+            )
+            if result.matched_count != 1:
+                raise conflict()
+        await self._collection("budget_reservations").insert_one(
+            {
+                "_id": reservation_id,
+                "reservation_id": reservation_id,
+                "run_id": task.run_id,
+                "task_id": task_id,
+                "user_id": self._user,
+                "ancestor_task_ids": list(account_ids),
+                "reserved": requested,
+                "status": "reserved",
+                "actual": None,
+                "charged": None,
+                "usage_unknown": False,
+            },
+            session=self._session,
+        )
+        await self._event(
+            task.run_id,
+            "budget.reserved",
+            task_id=task_id,
+            details=JsonObject(json.dumps({"reservation_id": reservation_id, "units": requested})),
+        )
+
+    @mutation
+    async def reconcile_budget(
+        self, reservation_id: str, actual: BudgetUsage
+    ) -> None:
+        row = await self._collection("budget_reservations").find_one(
+            {"reservation_id": reservation_id, "user_id": self._user},
+            session=self._session,
+        )
+        require(row is not None, "Budget reservation is unavailable")
+        assert row is not None
+        supplied = actual.document()
+        if row["status"] == "reconciled":
+            require(row["actual"] == supplied, "Budget reconciliation cannot be changed")
+            return
+        charged = {
+            key: int(row["reserved"][key]) if value is None else value
+            for key, value in supplied.items()
+        }
+        usage_unknown = any(value is None for value in supplied.values())
+        for ancestor_id in row["ancestor_task_ids"]:
+            result = await self._collection("budget_accounts").update_one(
+                {"task_id": ancestor_id, "user_id": self._user},
+                {
+                    "$inc": {
+                        **{
+                            f"reserved.{key}": -int(value)
+                            for key, value in row["reserved"].items()
+                        },
+                        **{f"used.{key}": value for key, value in charged.items()},
+                        **({"unknown_usage_count": 1} if usage_unknown else {}),
+                    }
+                },
+                session=self._session,
+            )
+            if result.matched_count != 1:
+                raise HarnessError(ErrorCode.STORAGE, "Budget account is unavailable")
+        await self._collection("budget_reservations").update_one(
+            {"reservation_id": reservation_id, "user_id": self._user, "status": "reserved"},
+            {
+                "$set": {
+                    "status": "reconciled",
+                    "actual": supplied,
+                    "charged": charged,
+                    "usage_unknown": usage_unknown,
+                }
+            },
+            session=self._session,
+        )
+        await self._event(
+            row["run_id"],
+            "budget.reconciled",
+            task_id=row["task_id"],
+            details=JsonObject(
+                json.dumps(
+                    {
+                        "reservation_id": reservation_id,
+                        "actual": supplied,
+                        "charged": charged,
+                        "usage_unknown": usage_unknown,
+                    }
+                )
+            ),
+        )
+
+    @mutation
+    async def budget_snapshot(self, task_id: str) -> BudgetSnapshot:
+        task = await self.get_task(task_id)
+        require(task is not None, "Budget task is unavailable")
+        assert task is not None
+        row = await self._ensure_budget_account(task)
+        return BudgetSnapshot(
+            BudgetLimits(**row["limits"]),
+            BudgetUsage(**row["used"]),
+            BudgetUsage(**row["reserved"]),
+            int(row["unknown_usage_count"]),
+        )
+
+    @mutation
+    async def record_completion_decision(
+        self, run_id: str, task_id: str, decision: JsonObject
+    ) -> None:
+        task = await self.get_task(task_id)
+        require(task is not None and task.run_id == run_id, "Completion task is unavailable")
+        await self._event(
+            run_id,
+            "completion.validated",
+            task_id=task_id,
+            details=decision,
+        )
 
     async def invocations(self, run_id: str) -> tuple[Invocation, ...]:
         return tuple(
@@ -643,6 +884,7 @@ class MongoTransaction:
         version: int = 0,
         status: str | None = None,
         intent: ControlIntent | None = None,
+        details: JsonObject | None = None,
     ) -> None:
         self.check_active()
         previous = await self._collection("events").find_one(
@@ -658,7 +900,16 @@ class MongoTransaction:
             sequence,
             event_type,
             self._clock.utc_now(),
-            JsonObject(json.dumps({"version": version, "status": status, "intent": intent})),
+            JsonObject(
+                json.dumps(
+                    {
+                        "version": version,
+                        "status": status,
+                        "intent": intent,
+                        **(json.loads(details.text) if details is not None else {}),
+                    }
+                )
+            ),
             task_id,
         )
         await self._collection("events").insert_one(
@@ -826,6 +1077,7 @@ class MongoTransaction:
                 },
                 session=self._session,
             )
+        await self._ensure_budget_account(task)
         await self._event(
             task.run_id,
             "task.created",

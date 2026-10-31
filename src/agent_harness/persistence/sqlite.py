@@ -5,13 +5,14 @@ import json
 import sqlite3
 from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine
 from contextlib import asynccontextmanager
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Concatenate, ParamSpec, TypeVar
 
 import aiosqlite
 
+from agent_harness.domain.budgets import BudgetLimits, BudgetSnapshot, BudgetUsage
 from agent_harness.domain.entities import Checkpoint, Event, JsonObject, Run, Task
 from agent_harness.domain.errors import ErrorCode, HarnessError, require
 from agent_harness.domain.model import ModelResponse, Step, StepStatus
@@ -34,6 +35,25 @@ from agent_harness.persistence.tool_codec import (
     encode_invocation,
 )
 from agent_harness.ports.state import Clock, IdGenerator, StateTransaction
+
+
+@dataclass
+class _LegacyBudgetAccount:
+    limits: BudgetLimits
+    used: dict[str, int]
+    reserved: dict[str, int]
+    unknown_usage_count: int = 0
+
+
+@dataclass
+class _LegacyBudgetReservation:
+    run_id: str
+    task_id: str
+    user_id: str
+    ancestor_task_ids: tuple[str, ...]
+    reserved: dict[str, int]
+    actual: dict[str, int | None] | None = None
+    status: str = "reserved"
 
 
 def conflict() -> HarnessError:
@@ -71,6 +91,8 @@ class SQLiteStore:
         self._connection: aiosqlite.Connection | None = None
         self._lock = asyncio.Lock()
         self._owner: asyncio.Task[object] | None = None
+        self._budget_accounts: dict[str, _LegacyBudgetAccount] = {}
+        self._budget_reservations: dict[str, _LegacyBudgetReservation] = {}
 
     async def __aenter__(self) -> "SQLiteStore":
         async with self._lock:
@@ -103,7 +125,14 @@ class SQLiteStore:
             require(connection is not None, "Store is not open")
             assert connection is not None
             self._owner = asyncio.current_task()
-            tx = SQLiteTransaction(connection, user_id, self._clock, self._ids)
+            tx = SQLiteTransaction(
+                connection,
+                user_id,
+                self._clock,
+                self._ids,
+                self._budget_accounts,
+                self._budget_reservations,
+            )
             try:
                 await connection.execute("BEGIN IMMEDIATE")
                 yield tx
@@ -126,7 +155,13 @@ class SQLiteStore:
 
 class SQLiteTransaction:
     def __init__(
-        self, connection: aiosqlite.Connection, user_id: str, clock: Clock, ids: IdGenerator
+        self,
+        connection: aiosqlite.Connection,
+        user_id: str,
+        clock: Clock,
+        ids: IdGenerator,
+        budget_accounts: dict[str, _LegacyBudgetAccount],
+        budget_reservations: dict[str, _LegacyBudgetReservation],
     ) -> None:
         self._db = connection
         self._user = user_id
@@ -135,6 +170,8 @@ class SQLiteTransaction:
         self._owner = asyncio.current_task()
         self.active = True
         self.failed = False
+        self._budget_accounts = budget_accounts
+        self._budget_reservations = budget_reservations
 
     def check_active(self) -> None:
         require(
@@ -420,6 +457,7 @@ class SQLiteTransaction:
         version: int = 0,
         status: str | None = None,
         intent: ControlIntent | None = None,
+        details: JsonObject | None = None,
     ) -> None:
         self.check_active()
         # Only harness-authored status metadata is persisted; inputs/config/results are excluded.
@@ -436,7 +474,16 @@ class SQLiteTransaction:
             sequence,
             event_type,
             self._clock.utc_now(),
-            JsonObject(json.dumps({"version": version, "status": status, "intent": intent})),
+            JsonObject(
+                json.dumps(
+                    {
+                        "version": version,
+                        "status": status,
+                        "intent": intent,
+                        **(json.loads(details.text) if details is not None else {}),
+                    }
+                )
+            ),
             task_id,
         )
         await self._db.execute(
@@ -571,7 +618,144 @@ class SQLiteTransaction:
                 "INSERT INTO task_dependencies VALUES (?, ?, ?, ?)",
                 (task.task_id, dependency, task.run_id, task.user_id),
             )
+        await self._ensure_budget_account(task)
         await self._event(task.run_id, "task.created", task_id=task.task_id, status=task.status)
+
+    async def _task_ancestors(self, task_id: str) -> tuple[Task, ...]:
+        current = await self.get_task(task_id)
+        require(current is not None, "Budget task is unavailable")
+        chain: list[Task] = []
+        seen: set[str] = set()
+        while current is not None:
+            require(current.task_id not in seen, "Task ancestry contains a cycle")
+            seen.add(current.task_id)
+            chain.append(current)
+            if current.parent_task_id is None:
+                break
+            current = await self.get_task(current.parent_task_id)
+            require(
+                current is not None and current.run_id == chain[0].run_id,
+                "Budget ancestry crosses a run boundary",
+            )
+        return tuple(chain)
+
+    async def _ensure_budget_account(self, task: Task) -> _LegacyBudgetAccount:
+        account = self._budget_accounts.get(task.task_id)
+        if account is not None:
+            return account
+        run = await self.get_run(task.run_id)
+        require(run is not None, "Budget run is unavailable")
+        assert run is not None
+        configured = json.loads(run.config.budgets.text)
+        if task.parent_task_id is None:
+            limits = BudgetLimits(
+                int(configured.get("max_total_steps", configured.get("max_steps", 8))),
+                int(configured.get("max_total_tokens", 262144)),
+                int(configured.get("max_total_tool_calls", 128)),
+            )
+        else:
+            parent = await self.get_task(task.parent_task_id)
+            require(parent is not None, "Budget parent is unavailable")
+            assert parent is not None
+            parent_account = await self._ensure_budget_account(parent)
+            requested_steps = int(
+                json.loads(task.handoff.text).get("max_steps", parent_account.limits.steps)
+            )
+            limits = BudgetLimits(
+                min(requested_steps, parent_account.limits.steps),
+                parent_account.limits.tokens,
+                parent_account.limits.tool_calls,
+            )
+        account = _LegacyBudgetAccount(
+            limits, {"steps": 0, "tokens": 0, "tool_calls": 0},
+            {"steps": 0, "tokens": 0, "tool_calls": 0},
+        )
+        self._budget_accounts[task.task_id] = account
+        return account
+
+    @mutation
+    async def reserve_budget(
+        self, reservation_id: str, task_id: str, amount: BudgetUsage
+    ) -> None:
+        requested = amount.reservation()
+        existing = self._budget_reservations.get(reservation_id)
+        if existing is not None:
+            require(
+                existing.task_id == task_id and existing.reserved == requested,
+                "Budget reservation ID was reused with different work",
+            )
+            return
+        task = await self.get_task(task_id)
+        require(task is not None, "Budget task is unavailable")
+        assert task is not None
+        ancestors = await self._task_ancestors(task_id)
+        for ancestor in ancestors:
+            account = await self._ensure_budget_account(ancestor)
+            if any(
+                account.used[key] + account.reserved[key] + requested[key]
+                > account.limits.document()[key]
+                for key in requested
+            ):
+                raise HarnessError(ErrorCode.BUDGET_EXCEEDED, "Hierarchical run budget exhausted")
+        for ancestor in ancestors:
+            account = self._budget_accounts[ancestor.task_id]
+            for key, value in requested.items():
+                account.reserved[key] += value
+        self._budget_reservations[reservation_id] = _LegacyBudgetReservation(
+            task.run_id,
+            task_id,
+            self._user,
+            tuple(item.task_id for item in ancestors),
+            requested,
+        )
+
+    @mutation
+    async def reconcile_budget(
+        self, reservation_id: str, actual: BudgetUsage
+    ) -> None:
+        reservation = self._budget_reservations.get(reservation_id)
+        require(
+            reservation is not None and reservation.user_id == self._user,
+            "Budget reservation is unavailable",
+        )
+        assert reservation is not None
+        supplied = actual.document()
+        if reservation.status == "reconciled":
+            require(reservation.actual == supplied, "Budget reconciliation cannot be changed")
+            return
+        charged = {
+            key: reservation.reserved[key] if value is None else value
+            for key, value in supplied.items()
+        }
+        unknown = any(value is None for value in supplied.values())
+        for ancestor_id in reservation.ancestor_task_ids:
+            account = self._budget_accounts[ancestor_id]
+            for key, reserved in reservation.reserved.items():
+                account.reserved[key] -= reserved
+                require(account.reserved[key] >= 0, "Invalid budget reservation")
+                account.used[key] += charged[key]
+            account.unknown_usage_count += int(unknown)
+        reservation.actual = supplied
+        reservation.status = "reconciled"
+
+    async def budget_snapshot(self, task_id: str) -> BudgetSnapshot:
+        task = await self.get_task(task_id)
+        require(task is not None, "Budget task is unavailable")
+        assert task is not None
+        account = await self._ensure_budget_account(task)
+        return BudgetSnapshot(
+            account.limits,
+            BudgetUsage(**account.used),
+            BudgetUsage(**account.reserved),
+            account.unknown_usage_count,
+        )
+
+    @mutation
+    async def record_completion_decision(
+        self, run_id: str, task_id: str, decision: JsonObject
+    ) -> None:
+        task = await self.get_task(task_id)
+        require(task is not None and task.run_id == run_id, "Completion task is unavailable")
 
     async def get_task(self, task_id: str) -> Task | None:
         self.check_active()

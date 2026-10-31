@@ -1,9 +1,9 @@
 """Durable, bounded child-task creation and dependency-aware execution."""
 
-import asyncio
 import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from typing import Any
 from uuid import UUID, uuid5
 
 from agent_harness.agents.factory import AgentFactory
@@ -42,7 +42,10 @@ class DelegatedTask:
             ),
             "Delegated task identity and objective are required",
         )
-        require(len(self.alias) <= 64 and len(self.idempotency_key) <= 200, "Delegation key too long")
+        require(
+            len(self.alias) <= 64 and len(self.idempotency_key) <= 200,
+            "Delegation key too long",
+        )
         require(
             len(set(self.dependencies)) == len(self.dependencies)
             and len(set(self.capabilities)) == len(self.capabilities),
@@ -86,7 +89,10 @@ class TaskCoordinator:
                 (spec for spec in remaining if set(spec.dependencies) <= resolved), None
             )
             if ready is None:
-                raise HarnessError(ErrorCode.VALIDATION, "Delegated task dependencies contain a cycle")
+                raise HarnessError(
+                    ErrorCode.VALIDATION,
+                    "Delegated task dependencies contain a cycle",
+                )
             ordered.append(ready)
             remaining.remove(ready)
             resolved.add(ready.alias)
@@ -109,7 +115,9 @@ class TaskCoordinator:
             require(definition.may_delegate, "This agent definition cannot delegate")
             require(parent.depth < definition.max_depth, "Maximum delegation depth exceeded")
             existing_children = tuple(
-                task for task in await tx.tasks(parent.run_id) if task.parent_task_id == parent_task_id
+                task
+                for task in await tx.tasks(parent.run_id)
+                if task.parent_task_id == parent_task_id
             )
             all_run_tasks = await tx.tasks(parent.run_id)
             existing_total = sum(task.parent_task_id is not None for task in all_run_tasks)
@@ -208,12 +216,12 @@ class TaskCoordinator:
                     task = prior
                 else:
                     await tx.create_task(task)
-                    await tx.save_delegation(
-                        parent_task_id, spec.idempotency_key, task
-                    )
+                    await tx.save_delegation(parent_task_id, spec.idempotency_key, task)
                 children.append(task)
             if parent.status == TaskStatus.RUNNING:
-                await tx.transition_task(parent_task_id, parent.version, TaskStatus.WAITING_CHILDREN)
+                await tx.transition_task(
+                    parent_task_id, parent.version, TaskStatus.WAITING_CHILDREN
+                )
             elif parent.status != TaskStatus.WAITING_CHILDREN:
                 raise HarnessError(
                     ErrorCode.CONCURRENCY_CONFLICT,
@@ -254,10 +262,10 @@ class TaskCoordinator:
                             )
                             refreshed[current.task_id] = current
                     if current.status == TaskStatus.READY and current.dependencies:
-                        dependency_results = []
+                        dependency_results: list[dict[str, Any]] = []
                         for dependency_id in current.dependencies:
                             dependency = refreshed[dependency_id]
-                            dependency_artifacts = [
+                            dependency_artifacts: list[dict[str, Any]] = [
                                 {
                                     "artifact_id": artifact.artifact_id,
                                     "name": artifact.name,
@@ -281,9 +289,15 @@ class TaskCoordinator:
                                     "artifacts": dependency_artifacts,
                                 }
                             )
-                        handoff = json.loads(current.handoff.text)
+                        handoff: dict[str, Any] = json.loads(current.handoff.text)
                         handoff["dependency_results"] = dependency_results
-                        input_ids = set(handoff.get("input_artifact_ids", ()))
+                        raw_input_ids = handoff.get("input_artifact_ids", [])
+                        require(
+                            isinstance(raw_input_ids, list)
+                            and all(isinstance(item, str) for item in raw_input_ids),
+                            "Task handoff input_artifact_ids must be a list of strings",
+                        )
+                        input_ids = set(raw_input_ids)
                         input_ids.update(
                             artifact["artifact_id"]
                             for dependency in dependency_results
@@ -314,13 +328,52 @@ class TaskCoordinator:
                     in {TaskStatus.FAILED, TaskStatus.CANCELLED, TaskStatus.BLOCKED}
                 )
                 if failed:
-                    failed_outcome = True
-                    for item in pending:
-                        if item.status in {TaskStatus.PENDING, TaskStatus.READY}:
-                            await tx.transition_task(
-                                item.task_id, item.version, TaskStatus.BLOCKED
-                            )
-                    pending = ()
+                    if options.partial_result_policy != "allow":
+                        failed_outcome = True
+                        for item in pending:
+                            if item.status in {TaskStatus.PENDING, TaskStatus.READY}:
+                                await tx.transition_task(
+                                    item.task_id, item.version, TaskStatus.BLOCKED
+                                )
+                        pending = ()
+                    else:
+                        made_progress = True
+                        while made_progress:
+                            made_progress = False
+                            for item in all_children:
+                                current = refreshed[item.task_id]
+                                if current.status != TaskStatus.PENDING:
+                                    continue
+                                dependencies = [
+                                    refreshed[dependency_id]
+                                    for dependency_id in current.dependencies
+                                ]
+                                if any(
+                                    dependency.status
+                                    in {
+                                        TaskStatus.FAILED,
+                                        TaskStatus.CANCELLED,
+                                        TaskStatus.BLOCKED,
+                                    }
+                                    for dependency in dependencies
+                                ):
+                                    refreshed[item.task_id] = await tx.transition_task(
+                                        current.task_id,
+                                        current.version,
+                                        TaskStatus.BLOCKED,
+                                    )
+                                    made_progress = True
+                        ready = tuple(
+                            refreshed[child.task_id]
+                            for child in all_children
+                            if refreshed[child.task_id].status == TaskStatus.READY
+                        )
+                        pending = tuple(
+                            refreshed[child.task_id]
+                            for child in all_children
+                            if refreshed[child.task_id].status
+                            in {TaskStatus.PENDING, TaskStatus.READY, TaskStatus.RUNNING}
+                        )
                 if not pending:
                     break
             if failed_outcome:
@@ -340,14 +393,14 @@ class TaskCoordinator:
                 ready, execute_task, active_limit=limit
             )
         async with self.store.transaction(user_id) as tx:
-            parent = await tx.get_task(parent_task_id)
-            assert parent is not None
-            if parent.status == TaskStatus.WAITING_CHILDREN:
-                parent = await tx.transition_task(
-                    parent_task_id, parent.version, TaskStatus.READY
+            current_parent = await tx.get_task(parent_task_id)
+            assert current_parent is not None
+            if current_parent.status == TaskStatus.WAITING_CHILDREN:
+                current_parent = await tx.transition_task(
+                    parent_task_id, current_parent.version, TaskStatus.READY
                 )
-                parent = await tx.transition_task(
-                    parent_task_id, parent.version, TaskStatus.RUNNING
+                current_parent = await tx.transition_task(
+                    parent_task_id, current_parent.version, TaskStatus.RUNNING
                 )
             results = []
             for alias in aliases:

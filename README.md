@@ -1,7 +1,7 @@
 # Agent Harness
 
-A standalone Python agent harness under phased development. Phases 2 through 5
-are implemented; Phase 5 awaits human review. Runs,
+A standalone Python agent harness under phased development. Phases 2 through 6
+are implemented; Phases 5 and 6 await human review. Runs,
 model decisions, tool invocations, events and checkpoints persist in MongoDB.
 
 ## Run with Python
@@ -123,13 +123,33 @@ Independent ready children may run concurrently, while dependencies execute in
 order. The task scheduler admits work round-robin across runs and FIFO within a
 run; `task_concurrency` and `task_queue_capacity` set its bounds. Defaults cap
 delegation depth, each agent's child count, and each run at 16 children. The
-initial child-failure behavior is deterministic fail-fast; automatic child
-retries and collect-partial behavior are not enabled. Child results, failures,
-and artifact references return to the parent as structured observations.
+default child-failure behavior is fail-fast; set
+`partial_result_policy = "allow"` to continue independent children and permit a
+partial parent result. Child results, failures, and artifact references return
+to the parent as structured observations.
 Children may read only artifact IDs explicitly included in their handoff.
 
 Inspect the durable task tree with `inspect RUN_ID --user USER`. Handoffs are
 shown only with `--history` or through the local `trace` command.
+
+## Budgets and completion validation (Phase 6)
+
+Each model request reserves a step and token allowance before it starts; each
+tool execution reserves one tool call. MongoDB stores hierarchical account
+totals in `budget_accounts` and idempotent reservation/reconciliation records in
+`budget_reservations`. Reservations are charged to the task and every ancestor.
+Unknown provider token usage is charged at the reserved amount and counted in
+the account snapshot. Retry attempts use new reservations, so retries consume
+the same run-wide budget.
+
+Configure `max_total_steps`, `max_total_tokens`, and `max_total_tool_calls` in
+TOML. Retries are disabled by default; opt in with
+`retry_strategy = "transient_provider"` and `max_retries = 1` (bounded to three).
+`max_corrections` bounds response corrections after deterministic artifact and
+JSON Schema checks fail. `required_artifacts` and `result_schema` enable those
+checks. The default `partial_result_policy = "fail"` fails the parent if a
+required child fails; `"allow"` collects successful independent work and
+returns a partial run only when successful child work exists.
 
 ## Reproducible development installation
 

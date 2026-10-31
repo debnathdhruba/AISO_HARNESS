@@ -9,7 +9,7 @@ import typer
 
 from agent_harness.bootstrap import application, runner
 from agent_harness.config import Settings, load_settings
-from agent_harness.domain.entities import Run
+from agent_harness.domain.entities import Event, Run
 from agent_harness.domain.errors import HarnessError
 from agent_harness.domain.model import RunOptions
 from agent_harness.domain.states import RunStatus
@@ -160,6 +160,14 @@ async def inspect_run(
             invocations = await tx.invocations(run_id)
             artifacts = await tx.artifacts(run_id)
             tasks = await tx.tasks(run_id)
+            root_task_id = str(json.loads(run.config.policy.text)["root_task_id"])
+            budget = await tx.budget_snapshot(root_task_id)
+        result["budget"] = {
+            "limits": budget.limits.document(),
+            "used": budget.used.document(),
+            "reserved": budget.reserved.document(),
+            "unknown_usage_count": budget.unknown_usage_count,
+        }
         result["invocations"] = [
             {
                 "invocation_id": i.invocation_id,
@@ -255,7 +263,7 @@ def trace_command(
         value = await inspect_run(settings, user, run_id, history=True)
         async with application(settings) as services:
             async with services.store.transaction(user) as tx:
-                events = []
+                events: list[Event] = []
                 after = 0
                 while True:
                     batch = await tx.events(run_id, after=after, limit=1000)

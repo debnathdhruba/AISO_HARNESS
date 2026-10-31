@@ -6,6 +6,7 @@ from dataclasses import replace
 from datetime import timedelta
 from uuid import UUID, uuid5
 
+from agent_harness.domain.budgets import BudgetUsage
 from agent_harness.domain.entities import JsonObject
 from agent_harness.domain.errors import ErrorCode, HarnessError, require
 from agent_harness.domain.model import Message, Role, RunOptions, Step
@@ -19,7 +20,7 @@ from agent_harness.scheduling import (
     ResourceKind,
     ResourceScheduler,
 )
-from agent_harness.tools.registry import ToolRegistry
+from agent_harness.tools.registry import RegisteredTool, ToolRegistry
 
 ARTIFACT_TOOLS = frozenset({"read_file", "write_file", "search_files", "edit_file"})
 
@@ -197,9 +198,23 @@ class ToolExecutor:
             remaining = (run.deadline - self.clock.utc_now()).total_seconds()
             if remaining <= 0:
                 raise HarnessError(ErrorCode.DEADLINE_EXCEEDED, "Run deadline exceeded before tool")
+            reservation_id = f"tool:{invocation.invocation_id}"
+            async with self.store.transaction(step.user_id) as tx:
+                await tx.reserve_budget(
+                    reservation_id,
+                    invocation.task_id,
+                    BudgetUsage(steps=0, tokens=0, tool_calls=1),
+                )
+                await tx.reconcile_budget(
+                    reservation_id,
+                    BudgetUsage(steps=0, tokens=0, tool_calls=1),
+                )
             invocation = await self._change(invocation, InvocationStatus.EXECUTING)
             try:
-                async def invoke() -> JsonObject:
+                async def invoke(
+                    tool: RegisteredTool = tool,
+                    invocation: Invocation = invocation,
+                ) -> JsonObject:
                     if tool.blocking_execute is not None:
                         return await self.blocking_tools.run(tool.blocking_execute, invocation)
                     assert tool.execute is not None

@@ -68,6 +68,8 @@ phase records intent only; scheduling and cancellation effects come later.
 | invocations | invocation UUID; step/call unique index | Tool identity, arguments, state, result and error |
 | approvals | invocation UUID | User decision bound to exact tool version and arguments |
 | artifacts | artifact UUID; user/run/task/name/version unique index | Bounded artifact manifest and integrity metadata |
+| budget_accounts | task UUID; run/user index | Hierarchical limits, used/reserved totals, unknown usage count |
+| budget_reservations | reservation UUID; run/task/status index | Idempotent per-operation reservation and reconciliation state |
 
 Collections and indexes are ensured at application startup; MongoDB has no
 SQLite-style numbered schema migrations here. Existing local SQLite databases
@@ -77,6 +79,31 @@ excluded from run snapshots, and should be provided through
 Structured snapshots, event payloads, and checkpoint continuations are stored
 as native BSON documents/arrays rather than JSON text. Readers still accept
 the earlier string-encoded format for existing records.
+
+## Hierarchical budgets and completion (Phase 6)
+
+`budget_accounts` and `budget_reservations` are MongoDB collections and are
+updated in the same MongoDB transaction as the corresponding run events.
+Reservations charge the task and all ancestors. Duplicate reservation IDs with
+the same task and amount are idempotent; reuse with different work is rejected.
+Reconciliation is immutable and idempotent. Unknown usage consumes the
+reserved amount and increments `unknown_usage_count`. Model attempts reserve one
+step and a conservative token bound before generation; known provider usage
+replaces that token bound on reconciliation. Tool attempts reserve one call
+before execution. Retries create separate attempts and therefore consume
+additional budget.
+
+Completion decisions are deterministic and appended to the existing MongoDB
+`events` collection as `completion.validated`. A candidate must have no
+unresolved tool actions or required children; configured committed artifact
+names and JSON Schema constraints are also checked. Failed candidates receive
+bounded correction attempts. Partial child outcomes require the explicit
+`partial_result_policy = "allow"` setting.
+
+The legacy `SQLiteStore` remains for existing local development compatibility;
+its Phase 6 budget counters are process-local only and it does not persist
+budget or completion records. Production composition uses MongoDB. MongoDB
+transaction behavior has not been live-validated against Atlas for this phase.
 
 ## Database and agent trace
 
@@ -149,15 +176,12 @@ every source/target pair. No self-transitions or terminal reopenings are allowed
 | Invocation | unknown | succeeded, failed, via future explicit reconciliation only |
 | Invocation | succeeded / failed / cancelled | none |
 
-Invocation states are contracts only; no invocation repository/executor exists.
-Transition validation does not prove task acceptance criteria, authorize side
-effects, enforce deadlines or implement budgets. Those belong to later services.
+Invocation transition validation does not by itself prove task acceptance
+criteria or authorize side effects; those checks belong to application services.
 
 ## Limitations
 
-SQLite files hold private inputs/results/configuration in plain local storage;
-event payloads exclude them. Protect the local file with host access controls.
 The API enforces principal scope but is not an authentication service. No process
-ownership lock, crash recovery scheduler, budget ledger, model call or tool effect
-exists yet. Single-cancellation rollback is tested; hard process interruption and
-repeated cancellation during cleanup belong to the later recovery phase.
+ownership lock, crash recovery scheduler, or startup reconciliation exists yet;
+those belong to Phase 7. Atlas transaction behavior and cross-process budget
+admission remain unverified.

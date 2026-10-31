@@ -31,7 +31,20 @@ class RunService:
             "1",
             model=options.snapshot(),
             policy=JsonObject(json.dumps({"root_task_id": task_id})),
-            budgets=JsonObject(json.dumps({"max_steps": options.max_steps})),
+            budgets=JsonObject(
+                json.dumps(
+                    {
+                        "max_steps": options.max_steps,
+                        "max_total_steps": options.max_total_steps,
+                        "max_total_tokens": options.max_total_tokens,
+                        "max_total_tool_calls": options.max_total_tool_calls,
+                        "retry_strategy": options.retry_strategy,
+                        "max_retries": options.max_retries,
+                        "max_corrections": options.max_corrections,
+                        "partial_result_policy": options.partial_result_policy,
+                    }
+                )
+            ),
         )
         run = Run(
             self._ids.new_id(),
@@ -50,6 +63,14 @@ class RunService:
             task_input,
             now,
             now,
+            acceptance_criteria=JsonObject(
+                json.dumps(
+                    {
+                        "required_artifacts": options.required_artifacts,
+                        "result_schema": json.loads(options.result_schema.text),
+                    }
+                )
+            ),
             deadline=run.deadline,
             agent_instance_id=self._ids.new_id(),
             agent_definition_id="coordinator",

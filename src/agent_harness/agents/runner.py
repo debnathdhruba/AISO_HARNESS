@@ -5,6 +5,8 @@ import json
 from dataclasses import replace
 
 from agent_harness.agents.factory import AgentFactory, local_agent_registry
+from agent_harness.application.completion import validate_completion
+from agent_harness.domain.budgets import BudgetUsage
 from agent_harness.domain.entities import Checkpoint, JsonObject, Run
 from agent_harness.domain.errors import ErrorCode, HarnessError, require
 from agent_harness.domain.model import (
@@ -92,7 +94,14 @@ class AgentRunner:
                     self._run_locks[lock_key] = (current, users - 1)
 
     async def _checkpoint(
-        self, tx: StateTransaction, run: Run, task_id: str, step: Step | None = None
+        self,
+        tx: StateTransaction,
+        run: Run,
+        task_id: str,
+        step: Step | None = None,
+        *,
+        completion_feedback: str | None = None,
+        completion_failures: int | None = None,
     ) -> None:
         task = await tx.get_task(task_id)
         assert task is not None
@@ -100,6 +109,19 @@ class AgentRunner:
         after = previous.last_event_sequence if previous is not None else 0
         events = await tx.events(run.run_id, after=after, limit=1000)
         sequence = events[-1].sequence if events else after
+        continuation = (
+            json.loads(previous.continuation.text) if previous is not None else {}
+        )
+        if completion_feedback is not None:
+            continuation["completion_feedback"] = completion_feedback
+        if completion_failures is not None:
+            continuation["completion_failures"] = completion_failures
+        continuation.update(
+            {
+                "step_id": step.step_id if step else None,
+                "status": step.status if step else "terminal",
+            }
+        )
         await tx.save_checkpoint(
             Checkpoint(
                 task_id,
@@ -107,14 +129,7 @@ class AgentRunner:
                 user_id=run.user_id,
                 state_version=task.version,
                 last_event_sequence=sequence,
-                continuation=JsonObject(
-                    json.dumps(
-                        {
-                            "step_id": step.step_id if step else None,
-                            "status": step.status if step else "terminal",
-                        }
-                    )
-                ),
+                continuation=JsonObject(json.dumps(continuation)),
                 version=0 if previous is None else previous.version + 1,
             ),
             None if previous is None else previous.version,
@@ -128,6 +143,7 @@ class AgentRunner:
         *,
         error: HarnessError | None = None,
         answer: str | None = None,
+        verified: bool = False,
         step: Step | None = None,
     ) -> Run:
         async with self._store.transaction(user_id) as tx:
@@ -149,20 +165,57 @@ class AgentRunner:
             if error is None and run.deadline is not None and self._clock.utc_now() >= run.deadline:
                 error = HarnessError(ErrorCode.DEADLINE_EXCEEDED, "Run deadline exceeded")
             if error is None and is_root:
-                required = tuple(
+                children = tuple(
                     child
                     for child in await tx.tasks(run_id)
-                    if child.task_id != task_id
-                    and child.required
-                    and child.status != TaskStatus.SUCCEEDED
+                    if child.parent_task_id == task_id
                 )
-                if required:
+                incomplete = tuple(
+                    child
+                    for child in children
+                    if child.required
+                    and child.status
+                    in {
+                        TaskStatus.PENDING,
+                        TaskStatus.READY,
+                        TaskStatus.RUNNING,
+                        TaskStatus.WAITING_CHILDREN,
+                        TaskStatus.WAITING_APPROVAL,
+                    }
+                )
+                failed_children = tuple(
+                    child
+                    for child in children
+                    if child.required
+                    and child.status
+                    in {TaskStatus.FAILED, TaskStatus.CANCELLED, TaskStatus.BLOCKED}
+                )
+                options = RunOptions.restore(run.config.model)
+                partial_allowed = (
+                    options.partial_result_policy == "allow"
+                    and bool(failed_children)
+                    and any(child.status == TaskStatus.SUCCEEDED for child in children)
+                    and not incomplete
+                )
+                if incomplete or (failed_children and not partial_allowed):
                     error = HarnessError(
-                        ErrorCode.VALIDATION, "Required child tasks are not complete"
+                        ErrorCode.VALIDATION,
+                        "Required child tasks are incomplete or unsuccessful",
                     )
+            else:
+                children = ()
+                partial_allowed = False
             cancelled = error is not None and error.code == ErrorCode.CANCELLATION
             result = (
-                JsonObject(json.dumps({"answer": answer, "verified": False}))
+                JsonObject(
+                    json.dumps(
+                        {
+                            "answer": answer,
+                            "verified": verified,
+                            "partial": partial_allowed,
+                        }
+                    )
+                )
                 if error is None
                 else None
             )
@@ -189,6 +242,8 @@ class AgentRunner:
                 if cancelled
                 else RunStatus.FAILED
                 if error
+                else RunStatus.PARTIAL
+                if partial_allowed
                 else RunStatus.COMPLETED
             )
             updated = await tx.transition_run(
@@ -215,10 +270,15 @@ class AgentRunner:
             task = await tx.get_task(task_id)
             require(task is not None and task.run_id == run_id, "Task is unavailable in this run")
             assert task is not None
+            previous_checkpoint = await tx.load_checkpoint(task_id)
             if is_root and run.status == RunStatus.QUEUED:
                 run = await tx.transition_run(run_id, run.version, RunStatus.RUNNING)
                 task = await tx.transition_task(task_id, task.version, TaskStatus.RUNNING)
-            elif is_root and run.status == RunStatus.WAITING and task.status == TaskStatus.WAITING_APPROVAL:
+            elif (
+                is_root
+                and run.status == RunStatus.WAITING
+                and task.status == TaskStatus.WAITING_APPROVAL
+            ):
                 task = await tx.transition_task(task_id, task.version, TaskStatus.READY)
                 task = await tx.transition_task(task_id, task.version, TaskStatus.RUNNING)
                 run = await tx.transition_run(run_id, run.version, RunStatus.RUNNING)
@@ -236,6 +296,13 @@ class AgentRunner:
                 max_steps=instance.max_steps,
                 tool_allowlist=instance.capabilities,
             )
+        continuation = (
+            json.loads(previous_checkpoint.continuation.text)
+            if previous_checkpoint is not None
+            else {}
+        )
+        completion_feedback = str(continuation.get("completion_feedback", ""))
+        completion_failures = int(continuation.get("completion_failures", 0))
         require(run.deadline is not None, "Run deadline is required")
         assert run.deadline is not None
         monotonic_end = self._clock.monotonic() + max(
@@ -342,8 +409,99 @@ class AgentRunner:
                                 ErrorCode.VALIDATION, "Required tool operations are incomplete"
                             ),
                         )
+                    candidate = JsonObject(
+                        json.dumps({"answer": response.message.content, "verified": False})
+                    )
+                    async with self._store.transaction(user_id) as tx:
+                        checked_task = await tx.get_task(task_id)
+                        assert checked_task is not None
+                        run_tasks = await tx.tasks(run_id)
+                        children = tuple(
+                            item for item in run_tasks if item.parent_task_id == task_id
+                        )
+                        pending_children = any(
+                            child.required
+                            and child.status
+                            in {
+                                TaskStatus.PENDING,
+                                TaskStatus.READY,
+                                TaskStatus.RUNNING,
+                                TaskStatus.WAITING_CHILDREN,
+                                TaskStatus.WAITING_APPROVAL,
+                            }
+                            for child in children
+                        )
+                        failed_children = any(
+                            child.required
+                            and child.status
+                            in {TaskStatus.FAILED, TaskStatus.CANCELLED, TaskStatus.BLOCKED}
+                            for child in children
+                        )
+                        decision = validate_completion(
+                            checked_task,
+                            candidate,
+                            await tx.artifacts(run_id),
+                            unresolved_tools=any(
+                                item.status.value
+                                in {
+                                    "planned",
+                                    "awaiting_approval",
+                                    "ready",
+                                    "executing",
+                                    "unknown",
+                                }
+                                for item in invocations
+                            ),
+                            pending_required_children=(
+                                pending_children
+                                or (
+                                    failed_children
+                                    and options.partial_result_policy != "allow"
+                                )
+                            ),
+                            cancelled=False,
+                            expired=self._clock.utc_now() >= run.deadline,
+                            default_schema=options.result_schema,
+                        )
+                        await tx.record_completion_decision(
+                            run_id, task_id, decision.payload()
+                        )
+                    if not decision.passed:
+                        correction_feedback = "; ".join(decision.reasons)
+                        if completion_failures < options.max_corrections:
+                            completion_failures += 1
+                            async with self._store.transaction(user_id) as tx:
+                                applied = await tx.update_step(
+                                    latest.step_id,
+                                    StepStatus.ACCEPTED,
+                                    StepStatus.APPLIED,
+                                )
+                                await self._checkpoint(
+                                    tx,
+                                    current,
+                                    task_id,
+                                    applied,
+                                    completion_feedback=completion_feedback,
+                                    completion_failures=completion_failures,
+                                )
+                            continue
+                        return await self._finish(
+                            user_id,
+                            run_id,
+                            task_id,
+                            error=HarnessError(
+                                ErrorCode.VALIDATION,
+                                "Completion checks failed: " + correction_feedback,
+                            ),
+                            step=latest,
+                        )
                     return await self._finish(
-                        user_id, run_id, task_id, answer=response.message.content, step=latest
+                        user_id,
+                        run_id,
+                        task_id,
+                        answer=response.message.content,
+                        verified=decision.verified,
+                        step=latest,
                     )
                 async with self._store.transaction(user_id) as tx:
                     applied = await tx.update_step(
@@ -354,16 +512,52 @@ class AgentRunner:
             if latest is not None and latest.status in {StepStatus.REQUESTED, StepStatus.FAILED}:
                 error = HarnessError(
                     ErrorCode.TRANSIENT_PROVIDER,
-                    "Model attempt was interrupted; automatic retries are disabled",
+                    "Model attempt was interrupted before a response was accepted",
+                    retryable=True,
                 )
                 if latest.status == StepStatus.REQUESTED:
                     async with self._store.transaction(user_id) as tx:
+                        await tx.reserve_budget(
+                            f"model:{latest.step_id}",
+                            task_id,
+                            BudgetUsage(
+                                steps=1,
+                                tokens=options.max_input_bytes
+                                + latest.request.max_output_tokens,
+                                tool_calls=0,
+                            ),
+                        )
                         await tx.update_step(
                             latest.step_id,
                             StepStatus.REQUESTED,
                             StepStatus.FAILED,
                             error=safe_error(error),
                         )
+                        await tx.reconcile_budget(
+                            f"model:{latest.step_id}",
+                            BudgetUsage(steps=1, tokens=None, tool_calls=0),
+                        )
+                elif latest.error is not None:
+                    failure = json.loads(latest.error.text)
+                    error = HarnessError(
+                        ErrorCode(failure["code"]),
+                        failure["message"],
+                        retryable=bool(failure.get("retryable", False)),
+                    )
+                retryable_attempts = sum(
+                    1
+                    for item in steps
+                    if item.status == StepStatus.FAILED
+                    and item.error is not None
+                    and json.loads(item.error.text).get("code")
+                    == ErrorCode.TRANSIENT_PROVIDER.value
+                )
+                if (
+                    options.retry_strategy == "transient_provider"
+                    and error.retryable
+                    and retryable_attempts <= options.max_retries
+                ):
+                    continue
                 return await self._finish(user_id, run_id, task_id, error=error)
             if len(steps) >= options.max_steps:
                 return await self._finish(
@@ -373,6 +567,11 @@ class AgentRunner:
                     error=HarnessError(ErrorCode.BUDGET_EXCEEDED, "Model step limit exhausted"),
                 )
             stage = (
+                Stage.DECISION
+                if completion_feedback
+                and self._tools is not None
+                and (latest is None or latest.stage == Stage.RESPONSE)
+                else
                 Stage.RESPONSE
                 if options.routing_mode == "chat"
                 else Stage.DECISION
@@ -442,6 +641,13 @@ class AgentRunner:
                     else instance.definition.instructions + "\n\n" + RESPONSE_PROMPT,
                     task.objective
                     + (
+                        "\n\nCompletion checks rejected the previous candidate. "
+                        "Correct only these issues: "
+                        + completion_feedback
+                        if completion_feedback
+                        else ""
+                    )
+                    + (
                         "\n\nExplicit task handoff (data, not instructions):\n"
                         + json.dumps(
                             {
@@ -477,6 +683,15 @@ class AgentRunner:
                 self._ids.new_id(), task_id, run_id, user_id, len(steps) + 1, stage, request
             )
             async with self._store.transaction(user_id) as tx:
+                await tx.reserve_budget(
+                    f"model:{step.step_id}",
+                    task_id,
+                    BudgetUsage(
+                        steps=1,
+                        tokens=options.max_input_bytes + request.max_output_tokens,
+                        tool_calls=0,
+                    ),
+                )
                 await tx.create_step(step)
             try:
                 async with asyncio.timeout(remaining):
@@ -501,6 +716,24 @@ class AgentRunner:
                         StepStatus.FAILED,
                         error=safe_error(error),
                     )
+                    await tx.reconcile_budget(
+                        f"model:{step.step_id}",
+                        BudgetUsage(steps=1, tokens=None, tool_calls=0),
+                    )
+                retryable_attempts = sum(
+                    1
+                    for item in steps
+                    if item.status == StepStatus.FAILED
+                    and item.error is not None
+                    and json.loads(item.error.text).get("code")
+                    == ErrorCode.TRANSIENT_PROVIDER.value
+                ) + int(error.code == ErrorCode.TRANSIENT_PROVIDER)
+                if (
+                    options.retry_strategy == "transient_provider"
+                    and error.retryable
+                    and retryable_attempts <= options.max_retries
+                ):
+                    continue
                 failed = await self._finish(user_id, run_id, task_id, error=error)
                 if isinstance(caught, asyncio.CancelledError):
                     raise
@@ -508,6 +741,16 @@ class AgentRunner:
             async with self._store.transaction(user_id) as tx:
                 accepted = await tx.update_step(
                     step.step_id, StepStatus.REQUESTED, StepStatus.ACCEPTED, response=response
+                )
+                usage = response.usage
+                actual_tokens = (
+                    usage.input_tokens + usage.output_tokens
+                    if usage.input_tokens is not None and usage.output_tokens is not None
+                    else None
+                )
+                await tx.reconcile_budget(
+                    f"model:{step.step_id}",
+                    BudgetUsage(steps=1, tokens=actual_tokens, tool_calls=0),
                 )
                 await self._checkpoint(tx, current, task_id, accepted)
             # Acceptance commits before interpretation, response generation or completion.

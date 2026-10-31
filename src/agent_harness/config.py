@@ -1,5 +1,6 @@
 """Trusted TOML/environment/CLI configuration, isolated from domain contracts."""
 
+import json
 import os
 import re
 import tomllib
@@ -7,8 +8,11 @@ from pathlib import Path
 from typing import Literal
 
 from dotenv import load_dotenv
+from jsonschema import Draft202012Validator
+from jsonschema.exceptions import SchemaError
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError, field_validator
 
+from agent_harness.domain.entities import JsonObject
 from agent_harness.domain.errors import ErrorCode, HarnessError
 from agent_harness.domain.model import RunOptions
 
@@ -44,6 +48,15 @@ class Settings(BaseModel):
     required_tools: tuple[str, ...] = ()
     routing_mode: Literal["auto", "chat", "tools", "two_stage"] = "auto"
     response_max_tokens: int = Field(default=512, ge=1, le=8192)
+    max_total_steps: int = Field(default=256, ge=1, le=4096)
+    max_total_tokens: int = Field(default=262144, ge=1, le=10_000_000)
+    max_total_tool_calls: int = Field(default=128, ge=1, le=4096)
+    retry_strategy: Literal["none", "transient_provider"] = "none"
+    max_retries: int = Field(default=0, ge=0, le=3)
+    max_corrections: int = Field(default=1, ge=0, le=3)
+    partial_result_policy: Literal["fail", "allow"] = "fail"
+    required_artifacts: tuple[str, ...] = ()
+    result_schema: dict[str, object] = Field(default_factory=dict)
     model_concurrency: int = Field(default=2, ge=1, le=32)
     model_queue_capacity: int = Field(default=8, ge=0, le=1024)
     model_provider_concurrency: int = Field(default=1, ge=1, le=32)
@@ -73,8 +86,19 @@ class Settings(BaseModel):
             raise ValueError("MongoDB database name contains unsupported characters")
         return value
 
+    @field_validator("result_schema")
+    @classmethod
+    def valid_result_schema(cls, value: dict[str, object]) -> dict[str, object]:
+        if value:
+            try:
+                Draft202012Validator.check_schema(value)
+            except SchemaError:
+                raise ValueError("Configured result schema is invalid") from None
+        return value
+
     def run_options(self) -> RunOptions:
         return RunOptions(
+            result_schema=JsonObject(json.dumps(self.result_schema)),
             **self.model_dump(
                 exclude={
                     "mongodb_uri",
@@ -93,6 +117,7 @@ class Settings(BaseModel):
                     "blocking_tool_queue_capacity",
                     "task_concurrency",
                     "task_queue_capacity",
+                    "result_schema",
                 }
             )
         )
