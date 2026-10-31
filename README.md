@@ -1,8 +1,8 @@
 # Agent Harness
 
-A standalone Python agent harness under phased development. Phases 2, 3 and 4
-are implemented; Phase 4 awaits human review before any Phase 5 work. Runs,
-model decisions, tool invocations, events and checkpoints persist in SQLite.
+A standalone Python agent harness under phased development. Phases 2 through 5
+are implemented; Phase 5 awaits human review. Runs,
+model decisions, tool invocations, events and checkpoints persist in MongoDB.
 
 ## Run with Python
 
@@ -11,6 +11,16 @@ With Ollama running, from this directory:
 ```powershell
 .\.venv\Scripts\python.exe -m agent_harness.interfaces.cli run --config examples/ollama.toml --task "Explain a queue in one sentence" --user local-user
 ```
+
+For an interactive prompt that accepts multiple tasks, run:
+
+```powershell
+.\run.bat
+```
+
+Type `exit` or `quit`, or press Ctrl+C, to stop the loop. You can also start it
+directly with `.\.venv\Scripts\python.exe -m agent_harness.interfaces.cli chat`;
+this defaults to `examples/ollama.toml` and user `local-user`.
 
 Ordinary questions now go straight to Gemma in one model call, capped at 512
 response tokens by default. Auto routing uses simple local rules and makes no
@@ -48,12 +58,26 @@ The project lives in `AIOS_HARNESS` as requested; its distribution is
 `agent-harness` and its import package is `agent_harness`. It does not require the
 AIOS reference checkout or Cerebrum. The existing `READEME.md` is preserved.
 
-All run state and trace data use one SQLite database by default:
-`.local/harness.sqlite`. Example configurations share this same file, so runs
-from either example remain visible together. Override it with `database` in
-TOML or `--database` on CLI commands. SQLite may create `-wal` and `-shm`
-sidecar files while the database is open; they are part of SQLite's operation,
-not extra databases.
+Run state and traces use MongoDB database `test` by default. Configure the
+connection in a project-root `.env` file as `AGENT_HARNESS_MONGODB_URI`;
+`database_name` can be set there as `AGENT_HARNESS_DATABASE_NAME` or overridden
+in TOML/with `--database-name`. The harness loads `.env` automatically without
+overriding environment variables already set by the shell. Credentials are
+secrets: do not put them in TOML, source control, or run snapshots. Atlas
+transactions require a replica-set deployment, as provided by Atlas. Existing
+`.local` SQLite files are not migrated or read by the new backend; remove them
+yourself if desired.
+
+Create a local `.env` from the safe template, then edit it with a rotated
+credential. URL-encode reserved characters in the password (`@` becomes `%40`):
+
+```powershell
+Copy-Item .env.example .env
+notepad .env
+```
+
+The password previously shared in chat was exposed and must be rotated before
+use. `.env` is ignored by Git; never commit it.
 
 Inspect a run's persisted model/tool/lifecycle trace with:
 
@@ -62,9 +86,9 @@ Inspect a run's persisted model/tool/lifecycle trace with:
 ```
 
 The trace includes private model prompts/responses and tool arguments/results.
-It is kept locally in the same SQLite database, not copied to a second trace
-database. This is the persisted harness trace, not raw provider network payloads
-or intermediate streaming tokens. Review access and file permissions accordingly.
+It is kept in the same MongoDB database, not copied to a second trace database.
+This is the persisted harness trace, not raw provider network payloads or
+intermediate streaming tokens. Restrict database credentials and access.
 
 ## Resource scheduling (Phase 4)
 
@@ -84,6 +108,28 @@ accumulating without bound.
 Trusted synchronous tools use a bounded thread pool. A timeout stops waiting for
 the result but does not claim to stop the running thread; its capacity remains in
 use until that thread actually finishes.
+
+## Agent delegation (Phase 5)
+
+Runs use the versioned local `coordinator` agent definition. It can delegate a
+bounded batch to the registered `researcher`, `writer`, or bounded
+`coordinator` definitions through `delegate_tasks`. Child objectives,
+capability subsets, acceptance criteria, artifact IDs, dependencies, and
+idempotency keys are persisted with their task records. Children inherit the
+same user and run deadline; requested tools and step limits can only narrow the
+parent's permissions and limits.
+
+Independent ready children may run concurrently, while dependencies execute in
+order. The task scheduler admits work round-robin across runs and FIFO within a
+run; `task_concurrency` and `task_queue_capacity` set its bounds. Defaults cap
+delegation depth, each agent's child count, and each run at 16 children. The
+initial child-failure behavior is deterministic fail-fast; automatic child
+retries and collect-partial behavior are not enabled. Child results, failures,
+and artifact references return to the parent as structured observations.
+Children may read only artifact IDs explicitly included in their handoff.
+
+Inspect the durable task tree with `inspect RUN_ID --user USER`. Handoffs are
+shown only with `--history` or through the local `trace` command.
 
 ## Reproducible development installation
 
@@ -110,9 +156,11 @@ dependency, report the required installation command rather than auto-syncing it
 
 `uv.lock` pins the resolved development and build dependencies; uv sync installs
 this project editable. Initial dependency installation requires internet or a
-populated package cache. Import and default tests require no network, credentials,
-GPU, external services, or model download. Python 3.11 is the validation baseline;
-the declared minimum is 3.11. Other interpreter versions are not yet validated.
+populated package cache. Runtime persistence requires a reachable MongoDB
+deployment and a configured URI. SQLite-specific tests remain available through
+the development extra; no tests connect to the configured MongoDB cluster.
+Python 3.11 is the validation baseline; the declared minimum is 3.11.
+Other interpreter versions are not yet validated.
 
 Standard tooling also works in an activated Python 3.11 virtual environment:
 `python -m pip install -e ".[dev]"`. This alternative resolves dependencies afresh;
@@ -121,18 +169,18 @@ updates use `uv lock --upgrade`, followed by every quality check and lock review
 
 See [architecture](docs/architecture.md), [decisions](docs/decisions/README.md),
 [state contracts](docs/durable-state.md), [phase tracker](docs/progress.md), and
-[Phase 1 review](docs/reviews/phase-01.md).
+[Phase 1 review](docs/reviews/phase-01.md) and
+[Phase 5/MongoDB handoff](docs/reviews/phase-05.md).
 
 ## Persisted-state demonstration
 
 This exercises the real persistence adapter, without simulating an agent loop:
 
 ```powershell
-New-Item -ItemType Directory -Force .local | Out-Null
 .\.venv\Scripts\python.exe examples\persisted_state.py
 ```
 
-The demo creates a fresh run and task, transitions them to queued/ready, saves a
-checkpoint, closes the database and reopens it. Output contains a generated run
-UUID, version 1, checkpoint state version 1 and four ordered events. Repeating
-the command adds a new run, preserving previous runs. `.local/` is git-ignored.
+The demo creates a fresh run and task in the configured MongoDB database,
+transitions them to queued/ready, saves a checkpoint, closes the client and
+reopens state. Output contains a generated run UUID, version 1, checkpoint state
+version 1 and four ordered events. Repeating the command adds a new run.

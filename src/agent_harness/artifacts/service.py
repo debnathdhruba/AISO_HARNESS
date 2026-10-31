@@ -1,4 +1,4 @@
-"""Bounded text artifacts, with explicit staging across the filesystem/SQLite gap."""
+"""Bounded text artifacts, with explicit staging across the filesystem/MongoDB gap."""
 
 import json
 import os
@@ -142,12 +142,17 @@ class ArtifactService:
 
     async def read(self, invocation: Invocation, artifact_id: str) -> JsonObject:
         async with self._store.transaction(invocation.user_id) as tx:
+            task = await tx.get_task(invocation.task_id)
+            handoff = json.loads(task.handoff.text) if task is not None else {}
+            shared_artifact_ids = set(handoff.get("input_artifact_ids", ()))
             record = next(
                 (
                     a
                     for a in await tx.artifacts(invocation.run_id)
                     if a.artifact_id == artifact_id
-                    and a.task_id == invocation.task_id
+                    and (
+                        a.task_id == invocation.task_id or artifact_id in shared_artifact_ids
+                    )
                     and a.status == "committed"
                 ),
                 None,

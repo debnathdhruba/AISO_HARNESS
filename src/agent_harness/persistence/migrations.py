@@ -78,6 +78,17 @@ MIGRATIONS: tuple[tuple[str, ...], ...] = (
         "CREATE INDEX invocations_run ON invocations(user_id,run_id)",
         "CREATE INDEX artifacts_run ON artifacts(user_id,run_id)",
     ),
+    (
+        """CREATE TABLE delegations (
+            parent_task_id TEXT NOT NULL, idempotency_key TEXT NOT NULL,
+            child_task_id TEXT NOT NULL UNIQUE, run_id TEXT NOT NULL, user_id TEXT NOT NULL,
+            PRIMARY KEY(parent_task_id, idempotency_key),
+            FOREIGN KEY(parent_task_id, run_id, user_id)
+                REFERENCES tasks(task_id, run_id, user_id),
+            FOREIGN KEY(child_task_id, run_id, user_id)
+                REFERENCES tasks(task_id, run_id, user_id))""",
+        "CREATE INDEX delegations_run ON delegations(user_id, run_id, parent_task_id)",
+    ),
 )
 
 

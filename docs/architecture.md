@@ -16,7 +16,7 @@ CLI / HTTP -> application services -> run controller
                                       |
                            ports -> concrete adapters
 
-State + events + budgets + checkpoints -> SQLite unit of work
+State + events + budgets + checkpoints -> MongoDB unit of work
 ```
 
 Domain objects use dataclasses/enums and have no infrastructure dependencies.
@@ -24,7 +24,8 @@ Application code depends on narrow Protocol ports. The composition root creates
 adapters and owns explicit startup/shutdown; constructors and imports start no work.
 Transport validation uses Pydantic v2 when introduced, not domain inheritance from
 HTTP schemas. CLI uses Typer, HTTP uses FastAPI/Uvicorn in its authorized phase.
-SQLite access will use aiosqlite, tool schemas a standards-compliant JSON Schema
+MongoDB access uses PyMongo's asynchronous client and transactional repository
+adapter; tool schemas use a standards-compliant JSON Schema
 validator. These dependencies are added and locked only when used. Provider SDKs
 remain optional; deterministic fake adapters precede real providers.
 
@@ -39,7 +40,7 @@ remain optional; deterministic fake adapters precede real providers.
 | interfaces | validation, principal resolution, presentation | application services, transport libraries |
 | bootstrap | wiring and lifecycle | all concrete components |
 
-No domain imports of SQLite, configuration singletons, transport frameworks or
+No domain imports of MongoDB, configuration singletons, transport frameworks or
 provider SDKs. No mutable global queues or implicit current user. Model output
 cannot confer authorization. Ruff bans reference-framework imports, and the
 foundation test audits all package source imports. Add layer-specific enforcement
@@ -57,7 +58,7 @@ bounds submitted thread work and retains its capacity after caller timeout until
 the underlying thread actually returns. It cannot forcibly terminate Python
 threads.
 
-SQLite is authoritative in one service process. Explicitly serialize transaction
+MongoDB is authoritative in one service process. Explicitly serialize transaction
 units, use optimistic state versions, and commit state/events atomically. Never
 await external work, approval or queue space inside a transaction. Futures,
 connections and callables are transient, never checkpoint data. Persist decisions
@@ -76,7 +77,7 @@ absolute/traversal paths and symlink/reparse-point components, use bounded
 UTF-8 text, and keep search results capped. File edits replace one exact match
 and fail if it is missing or ambiguous; writes remain non-read-only effects.
 
-Known end-state limits: trusted in-process tools, single-host SQLite ownership,
+known end-state limits: trusted in-process tools, single-service ownership,
 non-preemptive operations, uncertain provider usage and no universal exactly-once
 external effects. Phase 1 implements the durable state foundation described in
 [durable-state.md](durable-state.md); scheduling, budget enforcement, completion

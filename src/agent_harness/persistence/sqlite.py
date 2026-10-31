@@ -334,7 +334,7 @@ class SQLiteTransaction:
             task is not None and task.run_id == step.run_id and task.status == TaskStatus.RUNNING,
             "Step requires a running scoped task",
         )
-        previous = await self.steps(step.run_id)
+        previous = await self.steps(step.run_id, step.task_id)
         require(step.ordinal == len(previous) + 1, "Step ordinals must be contiguous")
         require(all(s.status == StepStatus.APPLIED for s in previous), "Prior step is unresolved")
         await self._db.execute(
@@ -357,11 +357,12 @@ class SQLiteTransaction:
             status=step.status,
         )
 
-    async def steps(self, run_id: str) -> tuple[Step, ...]:
+    async def steps(self, run_id: str, task_id: str | None = None) -> tuple[Step, ...]:
         self.check_active()
         async with self._db.execute(
-            "SELECT snapshot FROM steps WHERE run_id=? AND user_id=? ORDER BY ordinal",
-            (run_id, self._user),
+            "SELECT snapshot FROM steps WHERE run_id=? AND user_id=? "
+            "AND (? IS NULL OR task_id=?) ORDER BY ordinal",
+            (run_id, self._user, task_id, task_id),
         ) as cursor:
             rows = await cursor.fetchall()
         return tuple(decode_step(str(row[0])) for row in rows)
@@ -544,6 +545,7 @@ class SQLiteTransaction:
             task.version == 0 and task.status == TaskStatus.PENDING and task.result is None,
             "New tasks must be pristine",
         )
+        require(task.error is None, "New tasks cannot have an error")
         # Phase 1 only references already-created tasks. This prevents cycles by construction.
         for related in (*task.dependencies, task.parent_task_id):
             if related is not None:
@@ -579,6 +581,44 @@ class SQLiteTransaction:
             row = await cursor.fetchone()
         return decode_task(str(row[0])) if row else None
 
+    async def tasks(self, run_id: str) -> tuple[Task, ...]:
+        self.check_active()
+        async with self._db.execute(
+            "SELECT snapshot FROM tasks WHERE run_id=? AND user_id=? "
+            "ORDER BY rowid",
+            (run_id, self._user),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        return tuple(decode_task(str(row[0])) for row in rows)
+
+    async def delegated_task(self, parent_task_id: str, idempotency_key: str) -> Task | None:
+        self.check_active()
+        async with self._db.execute(
+            "SELECT t.snapshot FROM delegations d JOIN tasks t ON t.task_id=d.child_task_id "
+            "WHERE d.parent_task_id=? AND d.idempotency_key=? AND d.user_id=?",
+            (parent_task_id, idempotency_key, self._user),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return decode_task(str(row[0])) if row else None
+
+    @mutation
+    async def save_delegation(
+        self, parent_task_id: str, idempotency_key: str, task: Task
+    ) -> None:
+        self._scope(task.user_id)
+        parent = await self.get_task(parent_task_id)
+        require(
+            parent is not None
+            and task.parent_task_id == parent_task_id
+            and task.run_id == parent.run_id,
+            "Delegation parent and child must belong to the same run",
+        )
+        require(bool(idempotency_key.strip()), "Delegation idempotency key is required")
+        await self._db.execute(
+            "INSERT INTO delegations VALUES (?, ?, ?, ?, ?)",
+            (parent_task_id, idempotency_key, task.task_id, task.run_id, self._user),
+        )
+
     @mutation
     async def transition_task(
         self,
@@ -587,6 +627,7 @@ class SQLiteTransaction:
         status: TaskStatus,
         *,
         result: JsonObject | None = None,
+        error: JsonObject | None = None,
     ) -> Task:
         task = await self.get_task(task_id)
         if task is None:
@@ -598,6 +639,7 @@ class SQLiteTransaction:
             task,
             status=status,
             result=result,
+            error=error,
             version=task.version + 1,
             updated_at=self._clock.utc_now(),
         )
@@ -614,6 +656,36 @@ class SQLiteTransaction:
             task_id=task_id,
             version=updated.version,
             status=status,
+        )
+        return updated
+
+    @mutation
+    async def set_task_handoff(
+        self, task_id: str, expected_version: int, handoff: JsonObject
+    ) -> Task:
+        task = await self.get_task(task_id)
+        if task is None:
+            raise HarnessError(ErrorCode.AUTHORIZATION, "Task is unavailable to this principal")
+        if task.version != expected_version:
+            raise conflict()
+        require(task.status == TaskStatus.READY, "Handoff can only be finalized before execution")
+        updated = replace(
+            task,
+            handoff=handoff,
+            version=task.version + 1,
+            updated_at=self._clock.utc_now(),
+        )
+        async with self._db.execute(
+            "UPDATE tasks SET version=?,snapshot=? WHERE task_id=? AND user_id=? AND version=?",
+            (updated.version, encode(updated), task_id, self._user, expected_version),
+        ) as cursor:
+            if cursor.rowcount != 1:
+                raise conflict()
+        await self._event(
+            task.run_id,
+            "task.handoff_finalized",
+            task_id=task_id,
+            version=updated.version,
         )
         return updated
 

@@ -9,9 +9,10 @@ description = "Standalone durable agent harness"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "aiosqlite",
     "httpx",
     "pydantic>=2,<3",
+    "pymongo>=4.19,<5",
+    "python-dotenv>=1,<2",
     "typer",
     "jsonschema",
     "pytest>=9.2.0",
@@ -21,7 +22,7 @@ dependencies = [
 agent-harness = "agent_harness.interfaces.cli:main"
 
 [project.optional-dependencies]
-dev = ["hatchling", "mypy", "pytest", "pytest-asyncio", "ruff"]
+dev = ["aiosqlite", "hatchling", "mypy", "pytest", "pytest-asyncio", "ruff"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/agent_harness"]

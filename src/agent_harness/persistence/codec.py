@@ -44,4 +44,12 @@ def decode_task(text: str) -> Task:
     data["acceptance_criteria"] = JsonObject(**data["acceptance_criteria"])
     data["result"] = JsonObject(**data["result"]) if data["result"] is not None else None
     data["dependencies"] = tuple(data["dependencies"])
+    data.setdefault("agent_definition_id", "single-agent")
+    data.setdefault("agent_definition_version", "1")
+    data.setdefault("depth", 0)
+    data.setdefault("required", True)
+    data["capabilities"] = tuple(data.get("capabilities", ()))
+    data["handoff"] = JsonObject(**data.get("handoff", {"text": "{}"}))
+    data.setdefault("idempotency_key", None)
+    data["error"] = JsonObject(**data["error"]) if data.get("error") is not None else None
     return Task(**data)

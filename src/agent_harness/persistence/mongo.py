@@ -1,0 +1,1083 @@
+"""MongoDB persistence with scoped sessions and atomic transactional state changes."""
+
+import asyncio
+import json
+from collections.abc import AsyncGenerator, Awaitable, Callable, Coroutine
+from contextlib import asynccontextmanager
+from dataclasses import replace
+from datetime import datetime
+from functools import wraps
+from typing import Any, Concatenate, ParamSpec, TypeVar
+
+from pymongo import ASCENDING, DESCENDING, AsyncMongoClient
+from pymongo.asynchronous.client_session import AsyncClientSession
+from pymongo.errors import PyMongoError
+
+from agent_harness.domain.entities import Checkpoint, Event, JsonObject, Run, Task
+from agent_harness.domain.errors import ErrorCode, HarnessError, require
+from agent_harness.domain.model import ModelResponse, Step, StepStatus
+from agent_harness.domain.states import (
+    RUN_TRANSITIONS,
+    ControlIntent,
+    InvocationStatus,
+    RunStatus,
+    TaskStatus,
+    validate_transition,
+)
+from agent_harness.domain.tooling import Approval, ArtifactRecord, Invocation
+from agent_harness.models.codec import decode_step, encode_step
+from agent_harness.persistence.codec import decode_run, decode_task, encode
+from agent_harness.persistence.tool_codec import (
+    decode_artifact,
+    decode_invocation,
+    encode_artifact,
+    encode_invocation,
+)
+from agent_harness.ports.state import Clock, IdGenerator, StateTransaction
+
+Document = dict[str, Any]
+P = ParamSpec("P")
+V = TypeVar("V")
+
+RUN_JSON_PATHS = (
+    ("data", "config", "model"),
+    ("data", "config", "policy"),
+    ("data", "config", "budgets"),
+    ("data", "config", "memory"),
+    ("data", "config", "workspace"),
+    ("data", "result"),
+    ("data", "error"),
+)
+TASK_JSON_PATHS = (
+    ("data", "acceptance_criteria"),
+    ("data", "result"),
+    ("data", "handoff"),
+    ("data", "error"),
+)
+STEP_JSON_PATHS = (
+    ("data", "request", "messages", "*", "tool_calls", "*", "arguments"),
+    ("data", "request", "tools", "*", "input_schema"),
+    ("data", "request", "tools", "*", "output_schema"),
+    ("data", "response", "message", "tool_calls", "*", "arguments"),
+    ("data", "error"),
+)
+INVOCATION_JSON_PATHS = (("arguments",), ("result",), ("error",))
+
+
+def _update_path(value: Any, path: tuple[str, ...], transform: Callable[[Any], Any]) -> Any:
+    if not path:
+        return transform(value)
+    key, *remaining = path
+    if key == "*":
+        if isinstance(value, list):
+            return [_update_path(item, tuple(remaining), transform) for item in value]
+        return value
+    if isinstance(value, dict) and key in value and value[key] is not None:
+        value[key] = _update_path(value[key], tuple(remaining), transform)
+    return value
+
+
+def _native_snapshot(encoded: str, paths: tuple[tuple[str, ...], ...]) -> Document:
+    value = json.loads(encoded)
+    if not isinstance(value, dict):
+        raise HarnessError(ErrorCode.STORAGE, "Invalid persisted snapshot")
+    for path in paths:
+        value = _update_path(
+            value,
+            path,
+            lambda field: (
+                json.loads(field["text"])
+                if isinstance(field, dict) and set(field) == {"text"}
+                else field
+            ),
+        )
+    if not isinstance(value, dict):
+        raise HarnessError(ErrorCode.STORAGE, "Invalid persisted snapshot")
+    return value
+
+
+def _snapshot_text(value: str | Document, paths: tuple[tuple[str, ...], ...]) -> str:
+    if isinstance(value, str):
+        return value
+    for path in paths:
+        value = _update_path(
+            value,
+            path,
+            lambda field: {"text": json.dumps(field, sort_keys=True, separators=(",", ":"))},
+        )
+    return json.dumps(value, allow_nan=False, sort_keys=True)
+
+
+def _stored_json_text(value: str | Document) -> str:
+    return value if isinstance(value, str) else json.dumps(value)
+
+
+def conflict() -> HarnessError:
+    return HarnessError(ErrorCode.CONCURRENCY_CONFLICT, "State version changed", retryable=True)
+
+
+def mutation(
+    operation: Callable[Concatenate["MongoTransaction", P], Awaitable[V]],
+) -> Callable[Concatenate["MongoTransaction", P], Coroutine[Any, Any, V]]:
+    @wraps(operation)
+    async def guarded(tx: "MongoTransaction", /, *args: P.args, **kwargs: P.kwargs) -> V:
+        tx.check_active()
+        try:
+            return await operation(tx, *args, **kwargs)
+        except PyMongoError:
+            tx.failed = True
+            raise HarnessError(ErrorCode.STORAGE, "MongoDB operation failed") from None
+        except BaseException:
+            tx.failed = True
+            raise
+
+    return guarded
+
+
+class MongoStore:
+    """Application-owned async Mongo client; transactions are isolated per unit of work."""
+
+    def __init__(self, uri: str, database_name: str, clock: Clock, ids: IdGenerator) -> None:
+        require(bool(uri.strip()), "MongoDB URI is required")
+        require(bool(database_name.strip()), "MongoDB database name is required")
+        self._client: AsyncMongoClient[Document] = AsyncMongoClient(
+            uri, serverSelectionTimeoutMS=5000
+        )
+        self._database = self._client[database_name]
+        self._clock, self._ids = clock, ids
+        self._opened = False
+        self._active_transactions = 0
+        self._lifecycle_lock = asyncio.Lock()
+        self._transaction_lock = asyncio.Lock()
+        self._transaction_owner: asyncio.Task[object] | None = None
+
+    async def __aenter__(self) -> "MongoStore":
+        async with self._lifecycle_lock:
+            require(not self._opened, "Mongo store is already open")
+            try:
+                await self._client.admin.command("ping")
+                await self._ensure_indexes()
+            except PyMongoError:
+                await self._client.close()
+                raise HarnessError(ErrorCode.STORAGE, "Cannot connect to MongoDB") from None
+            self._opened = True
+        return self
+
+    async def __aexit__(self, *_: object) -> None:
+        require(
+            self._transaction_owner is not asyncio.current_task(),
+            "Cannot close MongoDB inside a transaction",
+        )
+        async with self._transaction_lock:
+            async with self._lifecycle_lock:
+                require(
+                    self._active_transactions == 0,
+                    "Cannot close MongoDB during a transaction",
+                )
+                if self._opened:
+                    self._opened = False
+                    await self._client.close()
+
+    async def _ensure_indexes(self) -> None:
+        definitions: dict[str, tuple[tuple[str, int], ...]] = {
+            "runs": (("user_id", ASCENDING), ("status", ASCENDING)),
+            "tasks": (
+                ("user_id", ASCENDING),
+                ("run_id", ASCENDING),
+                ("status", ASCENDING),
+            ),
+            "task_dependencies": (
+                ("task_id", ASCENDING),
+                ("dependency_id", ASCENDING),
+                ("run_id", ASCENDING),
+                ("user_id", ASCENDING),
+            ),
+            "events": (("run_id", ASCENDING), ("sequence", ASCENDING)),
+            "checkpoints": (("run_id", ASCENDING), ("user_id", ASCENDING)),
+            "steps": (
+                ("task_id", ASCENDING),
+                ("ordinal", ASCENDING),
+            ),
+            "invocations": (
+                ("step_id", ASCENDING),
+                ("call_id", ASCENDING),
+            ),
+            "approvals": (("user_id", ASCENDING),),
+            "artifacts": (
+                ("user_id", ASCENDING),
+                ("run_id", ASCENDING),
+                ("task_id", ASCENDING),
+                ("name", ASCENDING),
+                ("version", ASCENDING),
+            ),
+            "delegations": (
+                ("parent_task_id", ASCENDING),
+                ("idempotency_key", ASCENDING),
+            ),
+        }
+        for collection_name, keys in definitions.items():
+            collection = self._database[collection_name]
+            await collection.create_index(
+                list(keys),
+                unique=collection_name
+                in {
+                    "task_dependencies",
+                    "steps",
+                    "artifacts",
+                    "delegations",
+                    "events",
+                    "invocations",
+                },
+            )
+        for collection_name, field in (
+            ("events", "event_id"),
+            ("tasks", "task_id"),
+            ("runs", "run_id"),
+            ("steps", "step_id"),
+            ("invocations", "invocation_id"),
+            ("approvals", "invocation_id"),
+            ("artifacts", "artifact_id"),
+            ("checkpoints", "task_id"),
+        ):
+            await self._database[collection_name].create_index(field, unique=True)
+        await self._database["delegations"].create_index("child_task_id", unique=True)
+
+    @asynccontextmanager
+    async def transaction(self, user_id: str) -> AsyncGenerator[StateTransaction, None]:
+        require(bool(user_id.strip()), "Transaction principal is required")
+        require(
+            self._transaction_owner is not asyncio.current_task(),
+            "Nested transactions are not supported",
+        )
+        async with self._transaction_lock:
+            require(self._opened, "Mongo store is not open")
+            self._transaction_owner = asyncio.current_task()
+            async with self._lifecycle_lock:
+                self._active_transactions += 1
+            tx: MongoTransaction | None = None
+            try:
+                async with self._client.start_session() as session:
+                    async with await session.start_transaction():
+                        tx = MongoTransaction(
+                            self._database, session, user_id, self._clock, self._ids
+                        )
+                        try:
+                            yield tx
+                            tx.check_active()
+                            if tx.failed:
+                                raise HarnessError(
+                                    ErrorCode.STORAGE,
+                                    "Transaction must roll back after a failed mutation",
+                                )
+                        finally:
+                            tx.active = False
+            except PyMongoError:
+                raise HarnessError(ErrorCode.STORAGE, "MongoDB operation failed") from None
+            finally:
+                if tx is not None:
+                    tx.active = False
+                async with self._lifecycle_lock:
+                    self._active_transactions -= 1
+                self._transaction_owner = None
+
+
+class MongoTransaction:
+    def __init__(
+        self,
+        database: Any,
+        session: AsyncClientSession,
+        user_id: str,
+        clock: Clock,
+        ids: IdGenerator,
+    ) -> None:
+        self._db = database
+        self._session = session
+        self._user = user_id
+        self._clock, self._ids = clock, ids
+        self._owner = asyncio.current_task()
+        self.active = True
+        self.failed = False
+
+    def check_active(self) -> None:
+        require(
+            self.active and self._owner is asyncio.current_task(),
+            "Transaction is closed or belongs to another coroutine",
+        )
+
+    def _scope(self, user_id: str) -> None:
+        self.check_active()
+        if user_id != self._user:
+            raise HarnessError(ErrorCode.AUTHORIZATION, "Principal does not own this object")
+
+    def _collection(self, name: str) -> Any:
+        self.check_active()
+        return self._db[name]
+
+    async def _find(
+        self,
+        collection: str,
+        criteria: Document,
+        *,
+        sort: tuple[tuple[str, int], ...] = (("_id", ASCENDING),),
+        limit: int | None = None,
+    ) -> list[Document]:
+        cursor = self._collection(collection).find(criteria, session=self._session).sort(list(sort))
+        if limit is not None:
+            cursor = cursor.limit(limit)
+        return [item async for item in cursor]
+
+    async def invocations(self, run_id: str) -> tuple[Invocation, ...]:
+        return tuple(
+            decode_invocation(_snapshot_text(row["snapshot"], INVOCATION_JSON_PATHS))
+            for row in await self._find("invocations", {"run_id": run_id, "user_id": self._user})
+        )
+
+    async def get_invocation(self, invocation_id: str) -> Invocation | None:
+        row = await self._collection("invocations").find_one(
+            {"invocation_id": invocation_id, "user_id": self._user},
+            session=self._session,
+        )
+        return (
+            decode_invocation(_snapshot_text(row["snapshot"], INVOCATION_JSON_PATHS))
+            if row
+            else None
+        )
+
+    @mutation
+    async def save_invocation(
+        self, invocation: Invocation, expected: InvocationStatus | None
+    ) -> None:
+        self._scope(invocation.user_id)
+        previous = await self.get_invocation(invocation.invocation_id)
+        if (previous.status if previous else None) != expected:
+            raise conflict()
+        if previous is None:
+            require(
+                invocation.status == InvocationStatus.PLANNED,
+                "Invocation must start planned",
+            )
+            step_records = await self.steps(invocation.run_id, invocation.task_id)
+            require(
+                any(
+                    step.step_id == invocation.step_id and step.status == StepStatus.ACCEPTED
+                    for step in step_records
+                ),
+                "Invocation requires an accepted decision",
+            )
+            await self._collection("invocations").insert_one(
+                {
+                    "_id": invocation.invocation_id,
+                    "invocation_id": invocation.invocation_id,
+                    "run_id": invocation.run_id,
+                    "task_id": invocation.task_id,
+                    "user_id": invocation.user_id,
+                    "step_id": invocation.step_id,
+                    "call_id": invocation.call_id,
+                    "status": invocation.status.value,
+                    "snapshot": _native_snapshot(
+                        encode_invocation(invocation), INVOCATION_JSON_PATHS
+                    ),
+                },
+                session=self._session,
+            )
+        else:
+            validate_transition(previous.status, invocation.status)
+            require(
+                replace(
+                    previous,
+                    status=invocation.status,
+                    result=invocation.result,
+                    error=invocation.error,
+                )
+                == invocation,
+                "Invocation identity, arguments and approval binding are immutable",
+            )
+            result = await self._collection("invocations").replace_one(
+                {
+                    "invocation_id": invocation.invocation_id,
+                    "user_id": self._user,
+                    "status": previous.status.value,
+                },
+                {
+                    "_id": invocation.invocation_id,
+                    "invocation_id": invocation.invocation_id,
+                    "run_id": invocation.run_id,
+                    "task_id": invocation.task_id,
+                    "user_id": invocation.user_id,
+                    "step_id": invocation.step_id,
+                    "call_id": invocation.call_id,
+                    "status": invocation.status.value,
+                    "snapshot": _native_snapshot(
+                        encode_invocation(invocation), INVOCATION_JSON_PATHS
+                    ),
+                },
+                session=self._session,
+            )
+            if result.matched_count != 1:
+                raise conflict()
+        await self._event(
+            invocation.run_id,
+            f"invocation.{invocation.status.value}",
+            task_id=invocation.task_id,
+            status=invocation.status,
+        )
+
+    async def get_approval(self, invocation_id: str) -> Approval | None:
+        row = await self._collection("approvals").find_one(
+            {"invocation_id": invocation_id, "user_id": self._user},
+            session=self._session,
+        )
+        if row is None:
+            return None
+        return Approval(
+            str(row["invocation_id"]),
+            str(row["user_id"]),
+            str(row["tool_version"]),
+            str(row["argument_hash"]),
+            bool(row["approved"]),
+            datetime.fromisoformat(str(row["expires_at"])),
+        )
+
+    @mutation
+    async def save_approval(self, approval: Approval) -> None:
+        self._scope(approval.user_id)
+        invocation = await self.get_invocation(approval.invocation_id)
+        require(invocation is not None, "Invocation unavailable")
+        assert invocation is not None
+        require(
+            invocation.status == InvocationStatus.AWAITING_APPROVAL
+            and invocation.argument_hash == approval.argument_hash
+            and invocation.tool_version == approval.tool_version
+            and invocation.approval_expires_at == approval.expires_at
+            and approval.expires_at > self._clock.utc_now(),
+            "Approval binding is invalid or expired",
+        )
+        await self._collection("approvals").insert_one(
+            {
+                "_id": approval.invocation_id,
+                "invocation_id": approval.invocation_id,
+                "user_id": approval.user_id,
+                "tool_version": approval.tool_version,
+                "argument_hash": approval.argument_hash,
+                "approved": approval.approved,
+                "expires_at": approval.expires_at.isoformat(),
+            },
+            session=self._session,
+        )
+        await self.save_invocation(
+            replace(
+                invocation,
+                status=InvocationStatus.READY if approval.approved else InvocationStatus.FAILED,
+                error=None
+                if approval.approved
+                else JsonObject('{"code":"authorization","message":"Action denied"}'),
+            ),
+            InvocationStatus.AWAITING_APPROVAL,
+        )
+
+    async def artifacts(self, run_id: str) -> tuple[ArtifactRecord, ...]:
+        return tuple(
+            decode_artifact(
+                row["snapshot"] if isinstance(row["snapshot"], str) else json.dumps(row["snapshot"])
+            )
+            for row in await self._find(
+                "artifacts",
+                {"run_id": run_id, "user_id": self._user},
+                sort=(("name", ASCENDING), ("version", ASCENDING)),
+            )
+        )
+
+    @mutation
+    async def save_artifact(self, artifact: ArtifactRecord, expected: str | None) -> None:
+        self._scope(artifact.user_id)
+        row = await self._collection("artifacts").find_one(
+            {"artifact_id": artifact.artifact_id, "run_id": artifact.run_id, "user_id": self._user},
+            session=self._session,
+        )
+        previous = (
+            decode_artifact(
+                row["snapshot"] if isinstance(row["snapshot"], str) else json.dumps(row["snapshot"])
+            )
+            if row
+            else None
+        )
+        if (previous.status if previous else None) != expected:
+            raise conflict()
+        document = {
+            "_id": artifact.artifact_id,
+            "artifact_id": artifact.artifact_id,
+            "run_id": artifact.run_id,
+            "task_id": artifact.task_id,
+            "user_id": artifact.user_id,
+            "name": artifact.name,
+            "version": artifact.version,
+            "status": artifact.status,
+            "snapshot": json.loads(encode_artifact(artifact)),
+        }
+        if previous is None:
+            require(artifact.status == "staged", "New manifest must be staged")
+            await self._collection("artifacts").insert_one(document, session=self._session)
+        else:
+            require(
+                previous.status == "staged"
+                and artifact.status == "committed"
+                and replace(previous, status="committed") == artifact,
+                "Invalid manifest transition",
+            )
+            result = await self._collection("artifacts").replace_one(
+                {"artifact_id": artifact.artifact_id, "status": "staged", "user_id": self._user},
+                document,
+                session=self._session,
+            )
+            if result.matched_count != 1:
+                raise conflict()
+        await self._event(artifact.run_id, f"artifact.{artifact.status}", task_id=artifact.task_id)
+
+    @mutation
+    async def create_step(self, step: Step) -> None:
+        self._scope(step.user_id)
+        require(step.status == StepStatus.REQUESTED, "New step must be requested")
+        task = await self.get_task(step.task_id)
+        require(
+            task is not None and task.run_id == step.run_id and task.status == TaskStatus.RUNNING,
+            "Step requires a running scoped task",
+        )
+        previous = await self.steps(step.run_id, step.task_id)
+        require(step.ordinal == len(previous) + 1, "Step ordinals must be contiguous")
+        require(
+            all(item.status == StepStatus.APPLIED for item in previous),
+            "Prior step is unresolved",
+        )
+        await self._collection("steps").insert_one(
+            {
+                "_id": step.step_id,
+                "step_id": step.step_id,
+                "task_id": step.task_id,
+                "run_id": step.run_id,
+                "user_id": step.user_id,
+                "ordinal": step.ordinal,
+                "status": step.status.value,
+                "snapshot": _native_snapshot(encode_step(step), STEP_JSON_PATHS),
+            },
+            session=self._session,
+        )
+        await self._event(
+            step.run_id,
+            "step.requested",
+            task_id=step.task_id,
+            version=step.ordinal,
+            status=step.status,
+        )
+
+    async def steps(self, run_id: str, task_id: str | None = None) -> tuple[Step, ...]:
+        criteria: Document = {"run_id": run_id, "user_id": self._user}
+        if task_id is not None:
+            criteria["task_id"] = task_id
+        return tuple(
+            decode_step(_snapshot_text(row["snapshot"], STEP_JSON_PATHS))
+            for row in await self._find("steps", criteria, sort=(("ordinal", ASCENDING),))
+        )
+
+    @mutation
+    async def update_step(
+        self,
+        step_id: str,
+        expected: StepStatus,
+        status: StepStatus,
+        *,
+        response: ModelResponse | None = None,
+        error: JsonObject | None = None,
+    ) -> Step:
+        row = await self._collection("steps").find_one(
+            {"step_id": step_id, "user_id": self._user},
+            session=self._session,
+        )
+        require(row is not None, "Step is unavailable")
+        assert row is not None
+        step = decode_step(_snapshot_text(row["snapshot"], STEP_JSON_PATHS))
+        if step.status != expected:
+            raise conflict()
+        allowed = {
+            StepStatus.REQUESTED: {StepStatus.ACCEPTED, StepStatus.FAILED},
+            StepStatus.ACCEPTED: {StepStatus.APPLIED},
+            StepStatus.APPLIED: set(),
+            StepStatus.FAILED: set(),
+        }
+        require(status in allowed[expected], "Invalid step transition")
+        require(
+            response is None or expected == StepStatus.REQUESTED,
+            "Accepted decisions are immutable",
+        )
+        updated = replace(step, status=status, response=response or step.response, error=error)
+        result = await self._collection("steps").replace_one(
+            {"step_id": step_id, "user_id": self._user, "status": expected.value},
+            {
+                "_id": step_id,
+                "step_id": step_id,
+                "task_id": step.task_id,
+                "run_id": step.run_id,
+                "user_id": self._user,
+                "ordinal": step.ordinal,
+                "status": status.value,
+                "snapshot": _native_snapshot(encode_step(updated), STEP_JSON_PATHS),
+            },
+            session=self._session,
+        )
+        if result.matched_count != 1:
+            raise conflict()
+        await self._event(
+            step.run_id,
+            f"step.{status.value}",
+            task_id=step.task_id,
+            version=step.ordinal,
+            status=status,
+        )
+        return updated
+
+    async def _event(
+        self,
+        run_id: str,
+        event_type: str,
+        *,
+        task_id: str | None = None,
+        version: int = 0,
+        status: str | None = None,
+        intent: ControlIntent | None = None,
+    ) -> None:
+        self.check_active()
+        previous = await self._collection("events").find_one(
+            {"run_id": run_id, "user_id": self._user},
+            sort=[("sequence", DESCENDING)],
+            session=self._session,
+        )
+        sequence = int(previous["sequence"]) + 1 if previous else 1
+        event = Event(
+            self._ids.new_id(),
+            run_id,
+            self._user,
+            sequence,
+            event_type,
+            self._clock.utc_now(),
+            JsonObject(json.dumps({"version": version, "status": status, "intent": intent})),
+            task_id,
+        )
+        await self._collection("events").insert_one(
+            {
+                "_id": event.event_id,
+                "event_id": event.event_id,
+                "run_id": run_id,
+                "user_id": self._user,
+                "sequence": sequence,
+                "task_id": task_id,
+                "schema_version": event.schema_version,
+                "event_type": event_type,
+                "timestamp": event.timestamp.isoformat(),
+                "payload": json.loads(event.payload.text),
+            },
+            session=self._session,
+        )
+
+    @mutation
+    async def create_run(self, run: Run) -> None:
+        self._scope(run.user_id)
+        require(
+            run.version == 0
+            and run.status == RunStatus.CREATED
+            and run.intent == ControlIntent.NONE
+            and run.result is None
+            and run.error is None,
+            "New runs must be pristine",
+        )
+        await self._collection("runs").insert_one(
+            {
+                "_id": run.run_id,
+                "run_id": run.run_id,
+                "user_id": run.user_id,
+                "status": run.status.value,
+                "version": run.version,
+                "snapshot": _native_snapshot(encode(run), RUN_JSON_PATHS),
+                "control_intent": run.intent.value,
+            },
+            session=self._session,
+        )
+        await self._event(run.run_id, "run.created", status=run.status.value)
+
+    async def get_run(self, run_id: str) -> Run | None:
+        row = await self._collection("runs").find_one(
+            {"run_id": run_id, "user_id": self._user},
+            session=self._session,
+        )
+        return decode_run(_snapshot_text(row["snapshot"], RUN_JSON_PATHS)) if row else None
+
+    async def _run(self, run_id: str, version: int) -> Run:
+        run = await self.get_run(run_id)
+        if run is None:
+            raise HarnessError(ErrorCode.AUTHORIZATION, "Run is unavailable to this principal")
+        if run.version != version:
+            raise conflict()
+        return run
+
+    async def _save_run(self, run: Run, previous: int, event_type: str) -> Run:
+        result = await self._collection("runs").replace_one(
+            {"run_id": run.run_id, "user_id": self._user, "version": previous},
+            {
+                "_id": run.run_id,
+                "run_id": run.run_id,
+                "user_id": self._user,
+                "status": run.status.value,
+                "version": run.version,
+                "snapshot": _native_snapshot(encode(run), RUN_JSON_PATHS),
+                "control_intent": run.intent.value,
+            },
+            session=self._session,
+        )
+        if result.matched_count != 1:
+            raise conflict()
+        await self._event(
+            run.run_id,
+            event_type,
+            version=run.version,
+            status=run.status.value,
+            intent=run.intent,
+        )
+        return run
+
+    @mutation
+    async def transition_run(
+        self,
+        run_id: str,
+        expected_version: int,
+        status: RunStatus,
+        *,
+        result: JsonObject | None = None,
+        error: JsonObject | None = None,
+    ) -> Run:
+        run = await self._run(run_id, expected_version)
+        validate_transition(run.status, status)
+        updated = replace(
+            run,
+            status=status,
+            result=result,
+            error=error,
+            version=run.version + 1,
+            updated_at=self._clock.utc_now(),
+        )
+        return await self._save_run(updated, expected_version, "run.transitioned")
+
+    @mutation
+    async def set_intent(self, run_id: str, expected_version: int, intent: ControlIntent) -> Run:
+        run = await self._run(run_id, expected_version)
+        require(bool(RUN_TRANSITIONS[run.status]), "Terminal runs are immutable")
+        require(run.intent != ControlIntent.CANCEL, "Cancellation intent cannot be revoked")
+        require(run.intent != intent, "Intent is already recorded")
+        updated = replace(
+            run,
+            intent=intent,
+            version=run.version + 1,
+            updated_at=self._clock.utc_now(),
+        )
+        return await self._save_run(updated, expected_version, "run.intent_changed")
+
+    @mutation
+    async def create_task(self, task: Task) -> None:
+        self._scope(task.user_id)
+        run = await self.get_run(task.run_id)
+        require(
+            run is not None and bool(RUN_TRANSITIONS[run.status]),
+            "Run is unavailable or terminal",
+        )
+        require(
+            task.version == 0
+            and task.status == TaskStatus.PENDING
+            and task.result is None
+            and task.error is None,
+            "New tasks must be pristine",
+        )
+        for related_id in (*task.dependencies, task.parent_task_id):
+            if related_id is None:
+                continue
+            related = await self.get_task(related_id)
+            require(
+                related is not None and related.run_id == task.run_id,
+                "Related task must exist in the same run",
+            )
+        await self._collection("tasks").insert_one(
+            {
+                "_id": task.task_id,
+                "task_id": task.task_id,
+                "run_id": task.run_id,
+                "user_id": task.user_id,
+                "parent_task_id": task.parent_task_id,
+                "status": task.status.value,
+                "version": task.version,
+                "snapshot": _native_snapshot(encode(task), TASK_JSON_PATHS),
+            },
+            session=self._session,
+        )
+        for dependency_id in task.dependencies:
+            key = f"{task.task_id}:{dependency_id}"
+            await self._collection("task_dependencies").insert_one(
+                {
+                    "_id": key,
+                    "task_id": task.task_id,
+                    "dependency_id": dependency_id,
+                    "run_id": task.run_id,
+                    "user_id": task.user_id,
+                },
+                session=self._session,
+            )
+        await self._event(
+            task.run_id,
+            "task.created",
+            task_id=task.task_id,
+            status=task.status.value,
+        )
+
+    async def get_task(self, task_id: str) -> Task | None:
+        row = await self._collection("tasks").find_one(
+            {"task_id": task_id, "user_id": self._user},
+            session=self._session,
+        )
+        return decode_task(_snapshot_text(row["snapshot"], TASK_JSON_PATHS)) if row else None
+
+    async def tasks(self, run_id: str) -> tuple[Task, ...]:
+        return tuple(
+            decode_task(_snapshot_text(row["snapshot"], TASK_JSON_PATHS))
+            for row in await self._find(
+                "tasks",
+                {"run_id": run_id, "user_id": self._user},
+                sort=(("task_id", ASCENDING),),
+            )
+        )
+
+    async def delegated_task(self, parent_task_id: str, idempotency_key: str) -> Task | None:
+        row = await self._collection("delegations").find_one(
+            {
+                "parent_task_id": parent_task_id,
+                "idempotency_key": idempotency_key,
+                "user_id": self._user,
+            },
+            session=self._session,
+        )
+        return await self.get_task(str(row["child_task_id"])) if row else None
+
+    @mutation
+    async def save_delegation(self, parent_task_id: str, idempotency_key: str, task: Task) -> None:
+        self._scope(task.user_id)
+        parent = await self.get_task(parent_task_id)
+        require(
+            parent is not None
+            and task.parent_task_id == parent_task_id
+            and task.run_id == parent.run_id,
+            "Delegation parent and child must belong to the same run",
+        )
+        require(bool(idempotency_key.strip()), "Delegation idempotency key is required")
+        await self._collection("delegations").insert_one(
+            {
+                "_id": f"{parent_task_id}:{idempotency_key}",
+                "parent_task_id": parent_task_id,
+                "idempotency_key": idempotency_key,
+                "child_task_id": task.task_id,
+                "run_id": task.run_id,
+                "user_id": task.user_id,
+            },
+            session=self._session,
+        )
+
+    @mutation
+    async def transition_task(
+        self,
+        task_id: str,
+        expected_version: int,
+        status: TaskStatus,
+        *,
+        result: JsonObject | None = None,
+        error: JsonObject | None = None,
+    ) -> Task:
+        task = await self.get_task(task_id)
+        if task is None:
+            raise HarnessError(ErrorCode.AUTHORIZATION, "Task is unavailable to this principal")
+        if task.version != expected_version:
+            raise conflict()
+        validate_transition(task.status, status)
+        updated = replace(
+            task,
+            status=status,
+            result=result,
+            error=error,
+            version=task.version + 1,
+            updated_at=self._clock.utc_now(),
+        )
+        result_doc = await self._collection("tasks").replace_one(
+            {
+                "task_id": task_id,
+                "user_id": self._user,
+                "version": expected_version,
+            },
+            {
+                "_id": task_id,
+                "task_id": task_id,
+                "run_id": task.run_id,
+                "user_id": self._user,
+                "parent_task_id": task.parent_task_id,
+                "status": status.value,
+                "version": updated.version,
+                "snapshot": _native_snapshot(encode(updated), TASK_JSON_PATHS),
+            },
+            session=self._session,
+        )
+        if result_doc.matched_count != 1:
+            raise conflict()
+        await self._event(
+            task.run_id,
+            "task.transitioned",
+            task_id=task_id,
+            version=updated.version,
+            status=status.value,
+        )
+        return updated
+
+    @mutation
+    async def set_task_handoff(
+        self, task_id: str, expected_version: int, handoff: JsonObject
+    ) -> Task:
+        task = await self.get_task(task_id)
+        if task is None:
+            raise HarnessError(ErrorCode.AUTHORIZATION, "Task is unavailable to this principal")
+        if task.version != expected_version:
+            raise conflict()
+        require(task.status == TaskStatus.READY, "Handoff can only be finalized before execution")
+        updated = replace(
+            task,
+            handoff=handoff,
+            version=task.version + 1,
+            updated_at=self._clock.utc_now(),
+        )
+        result = await self._collection("tasks").replace_one(
+            {
+                "task_id": task_id,
+                "user_id": self._user,
+                "version": expected_version,
+            },
+            {
+                "_id": task_id,
+                "task_id": task_id,
+                "run_id": task.run_id,
+                "user_id": self._user,
+                "parent_task_id": task.parent_task_id,
+                "status": task.status.value,
+                "version": updated.version,
+                "snapshot": _native_snapshot(encode(updated), TASK_JSON_PATHS),
+            },
+            session=self._session,
+        )
+        if result.matched_count != 1:
+            raise conflict()
+        await self._event(
+            task.run_id,
+            "task.handoff_finalized",
+            task_id=task_id,
+            version=updated.version,
+        )
+        return updated
+
+    async def events(self, run_id: str, *, after: int = 0, limit: int = 100) -> tuple[Event, ...]:
+        self.check_active()
+        require(after >= 0 and 1 <= limit <= 1000, "Invalid event pagination")
+        rows = await self._find(
+            "events",
+            {"run_id": run_id, "user_id": self._user, "sequence": {"$gt": after}},
+            sort=(("sequence", ASCENDING),),
+            limit=limit,
+        )
+        return tuple(
+            Event(
+                str(row["event_id"]),
+                str(row["run_id"]),
+                str(row["user_id"]),
+                int(row["sequence"]),
+                str(row["event_type"]),
+                datetime.fromisoformat(str(row["timestamp"])),
+                JsonObject(_stored_json_text(row["payload"])),
+                row.get("task_id"),
+                int(row["schema_version"]),
+            )
+            for row in rows
+        )
+
+    async def load_checkpoint(self, task_id: str) -> Checkpoint | None:
+        row = await self._collection("checkpoints").find_one(
+            {"task_id": task_id, "user_id": self._user},
+            session=self._session,
+        )
+        if row is None:
+            return None
+        return Checkpoint(
+            str(row["task_id"]),
+            str(row["run_id"]),
+            str(row["user_id"]),
+            int(row["state_version"]),
+            int(row["last_event_sequence"]),
+            JsonObject(_stored_json_text(row["continuation"])),
+            int(row["version"]),
+            int(row["schema_version"]),
+        )
+
+    @mutation
+    async def save_checkpoint(self, checkpoint: Checkpoint, expected_version: int | None) -> None:
+        self._scope(checkpoint.user_id)
+        task = await self.get_task(checkpoint.task_id)
+        require(
+            task is not None and task.run_id == checkpoint.run_id,
+            "Checkpoint task is unavailable",
+        )
+        assert task is not None
+        if task.version != checkpoint.state_version:
+            raise conflict()
+        previous = await self.load_checkpoint(checkpoint.task_id)
+        if (previous.version if previous else None) != expected_version:
+            raise conflict()
+        require(
+            checkpoint.version == (0 if previous is None else previous.version + 1),
+            "Checkpoint version must advance exactly once",
+        )
+        if previous is not None:
+            require(
+                checkpoint.last_event_sequence >= previous.last_event_sequence,
+                "Checkpoint event cursor cannot move backwards",
+            )
+        task_events = await self._find(
+            "events",
+            {"run_id": task.run_id, "task_id": task.task_id, "user_id": self._user},
+            sort=(("sequence", DESCENDING),),
+        )
+        cursor_event = await self._collection("events").find_one(
+            {
+                "run_id": task.run_id,
+                "sequence": checkpoint.last_event_sequence,
+                "user_id": self._user,
+            },
+            session=self._session,
+        )
+        require(
+            bool(task_events)
+            and cursor_event is not None
+            and checkpoint.last_event_sequence >= int(task_events[0]["sequence"]),
+            "Checkpoint cursor is missing or misses task events",
+        )
+        await self._collection("checkpoints").replace_one(
+            {"task_id": checkpoint.task_id, "user_id": self._user},
+            {
+                "_id": checkpoint.task_id,
+                "task_id": checkpoint.task_id,
+                "run_id": checkpoint.run_id,
+                "user_id": checkpoint.user_id,
+                "schema_version": checkpoint.schema_version,
+                "version": checkpoint.version,
+                "state_version": checkpoint.state_version,
+                "last_event_sequence": checkpoint.last_event_sequence,
+                "continuation": json.loads(checkpoint.continuation.text),
+            },
+            upsert=expected_version is None,
+            session=self._session,
+        )

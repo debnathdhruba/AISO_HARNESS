@@ -1,5 +1,5 @@
 provider = "ollama"
-database = ".local/harness.sqlite"
+database_name = "test"
 ollama_url = "http://127.0.0.1:11434"
 decision_model = "lfm2.5-thinking:1.2b"
 response_model = "gemma3:1b"

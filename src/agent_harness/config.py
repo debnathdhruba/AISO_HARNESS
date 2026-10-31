@@ -1,11 +1,13 @@
 """Trusted TOML/environment/CLI configuration, isolated from domain contracts."""
 
 import os
+import re
 import tomllib
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from dotenv import load_dotenv
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError, field_validator
 
 from agent_harness.domain.errors import ErrorCode, HarnessError
 from agent_harness.domain.model import RunOptions
@@ -13,7 +15,8 @@ from agent_harness.domain.model import RunOptions
 
 class Settings(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
-    database: Path = Path(".local/harness.sqlite")
+    mongodb_uri: SecretStr = SecretStr("mongodb://127.0.0.1:27017")
+    database_name: str = Field(default="test", min_length=1, max_length=63)
     ollama_url: str = "http://127.0.0.1:11434"
     provider: Literal["fake", "ollama"] = "fake"
     decision_model: str = Field(default="lfm2.5-thinking:1.2b", min_length=1)
@@ -31,6 +34,7 @@ class Settings(BaseModel):
         "write_file",
         "search_files",
         "edit_file",
+        "delegate_tasks",
     )
     max_tool_calls: int = Field(default=8, ge=1, le=100)
     repeated_action_limit: int = Field(default=2, ge=1, le=10)
@@ -51,12 +55,30 @@ class Settings(BaseModel):
     memory_queue_capacity: int = Field(default=8, ge=0, le=1024)
     blocking_tool_workers: int = Field(default=2, ge=1, le=32)
     blocking_tool_queue_capacity: int = Field(default=8, ge=0, le=1024)
+    task_concurrency: int = Field(default=4, ge=1, le=32)
+    task_queue_capacity: int = Field(default=16, ge=0, le=1024)
+
+    @field_validator("mongodb_uri")
+    @classmethod
+    def valid_mongodb_uri(cls, value: SecretStr) -> SecretStr:
+        uri = value.get_secret_value()
+        if not uri.startswith(("mongodb://", "mongodb+srv://")):
+            raise ValueError("MongoDB URI must use mongodb:// or mongodb+srv://")
+        return value
+
+    @field_validator("database_name")
+    @classmethod
+    def valid_database_name(cls, value: str) -> str:
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,63}", value):
+            raise ValueError("MongoDB database name contains unsupported characters")
+        return value
 
     def run_options(self) -> RunOptions:
         return RunOptions(
             **self.model_dump(
                 exclude={
-                    "database",
+                    "mongodb_uri",
+                    "database_name",
                     "ollama_url",
                     "model_concurrency",
                     "model_queue_capacity",
@@ -69,6 +91,8 @@ class Settings(BaseModel):
                     "memory_queue_capacity",
                     "blocking_tool_workers",
                     "blocking_tool_queue_capacity",
+                    "task_concurrency",
+                    "task_queue_capacity",
                 }
             )
         )
@@ -76,6 +100,7 @@ class Settings(BaseModel):
 
 def load_settings(path: Path | None = None, **overrides: object) -> Settings:
     try:
+        load_dotenv(override=False)
         values: dict[str, object] = {}
         if path is not None:
             with path.open("rb") as stream:

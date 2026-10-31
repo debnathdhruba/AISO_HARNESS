@@ -82,3 +82,19 @@ outcomes permit only reconciliation to succeeded/failed, never automatic executi
 Blocked tasks are terminal; paused tasks return to pending for dependency evaluation.
 Retries are not implemented and cannot reopen terminal records. A later retry
 feature must add separate attempt records instead of resetting versions/status.
+
+## ADR-009: MongoDB persistence backend
+
+Status: accepted at the user's request; supersedes the SQLite runtime choice in
+ADR-003. The harness now uses PyMongo's asynchronous client and MongoDB
+transactions for run state, steps, invocations, events, checkpoints, approvals,
+artifact manifests, task dependencies and idempotent delegations. The default
+database is `test`; credentials are supplied through
+`AGENT_HARNESS_MONGODB_URI`, represented as a secret setting, and excluded from
+run snapshots.
+
+Existing SQLite data is not migrated or read. The earlier SQLite adapter remains
+only to support the unchanged legacy test suite; it is not wired into runtime
+bootstrap or packaged as a runtime dependency. MongoDB Atlas replica-set
+transactions are required. A process-local transaction lock preserves per-run
+event ordering; multi-process ownership/recovery remains a later phase.

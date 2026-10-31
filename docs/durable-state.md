@@ -22,25 +22,27 @@ contracts, attempt records and agent definitions will be introduced as consumed.
 ## Transactions and repositories
 
 ```python
-async with SQLiteStore(path, clock, ids) as store:
+async with MongoStore(uri, "test", clock, ids) as store:
     async with store.transaction("local-user") as tx:
         await tx.create_run(run)
         await tx.create_task(task)
 ```
 
-`StateStore` and `StateTransaction` are Protocols. The SQLite adapter implements
-the scoped repository operations within one unit of work. Creation and transition
+`StateStore` and `StateTransaction` are Protocols. `MongoStore` implements the
+scoped repository operations in MongoDB sessions and transactions. Creation and transition
 methods append events automatically; callers cannot forget the corresponding
 event. Successful context exit commits; errors/cancellation roll back. A caught
 mutation failure still prevents commit. Repository handles expire at context
 exit and cannot be used by another coroutine. Nested transactions fail promptly.
 
-A store-wide asyncio lock serializes transactions before BEGIN IMMEDIATE. SQLite
-foreign keys enforce related scope and WAL enables ordinary external readers.
-Do not await external model/tool work, resource admission or approval inside a
-transaction. A caller must not await a child coroutine that tries to open another
-transaction while holding its own transaction. Transactions are intentionally
-short and are not independent parallel operations on a shared connection.
+A process-local asyncio lock serializes short transaction units so per-run event
+sequences remain ordered. MongoDB unique indexes and expected-version filters
+enforce key and optimistic-concurrency invariants; repository methods validate
+relationship scope. Atlas replica-set support is required for transactions. Do
+not await model/tool work, resource admission or approval inside a transaction.
+Transactions must not be nested or shared with another coroutine. The harness
+still assumes one owning service process; cross-process scheduling ownership is
+future recovery work.
 
 `get_run`, `get_task`, `load_checkpoint` return None for missing or unowned IDs.
 Event queries return only the principal's records, ordered by per-run sequence,
@@ -52,50 +54,46 @@ Control intent is durable independently of status: recording cancellation does
 not claim that work has stopped. Cancellation intent cannot be revoked. This
 phase records intent only; scheduling and cancellation effects come later.
 
-## Database schema and evolution
+## MongoDB collections
 
-| Table | Key/ownership | Role |
+| Collection | Key / indexes | Role |
 | --- | --- | --- |
-| schema_migrations | ordered contiguous version | Applied schema history |
-| runs | UUID; unique run/user pair | Run snapshot, status/version, control intent |
-| tasks | UUID; unique task/run/user triple | Task snapshot and parent FK |
-| task_dependencies | task/dependency pair; scoped FKs | Durable dependency references |
-| events | run/sequence; unique event UUID | Append-only versioned metadata |
-| checkpoints | task UUID; scoped task FK and event FK | Versioned serialized continuation |
-| steps | task/ordinal; run-scoped snapshot | Complete model request and accepted response for each reasoning step |
-| invocations | step/call; run-scoped snapshot | Tool identity, arguments, state, result and error for each call |
-| approvals | invocation UUID | User approval/denial bound to exact tool version and arguments |
-| artifacts | artifact UUID and task/name/version | Bounded local artifact manifest and integrity metadata |
+| runs | run UUID; user/status index | Run snapshot, status/version and control intent |
+| tasks | task UUID; run/user/status index | Task snapshot, parent and assigned agent |
+| task_dependencies | task/dependency/run/user unique index | Durable dependency references |
+| delegations | parent/idempotency-key unique; child unique | Idempotent child creation |
+| events | run/sequence unique index | Append-only versioned metadata |
+| checkpoints | task UUID | Versioned serialized continuation |
+| steps | step UUID; task/ordinal unique index | Complete model request and accepted response |
+| invocations | invocation UUID; step/call unique index | Tool identity, arguments, state, result and error |
+| approvals | invocation UUID | User decision bound to exact tool version and arguments |
+| artifacts | artifact UUID; user/run/task/name/version unique index | Bounded artifact manifest and integrity metadata |
 
-Migration 1 creates base state, relationships, events, checkpoints, indexes and
-append-only event triggers. Migration 2 adds the run control_intent column with a
-default of none. Later migrations add model steps, tool invocations, approvals
-and artifact manifests. All pending migrations run in one transaction.
-Unsupported or non-contiguous history is rejected. Opening a current database
-is idempotent.
+Collections and indexes are ensured at application startup; MongoDB has no
+SQLite-style numbered schema migrations here. Existing local SQLite databases
+are intentionally not imported. The configured URI is held in `SecretStr`, is
+excluded from run snapshots, and should be provided through
+`AGENT_HARNESS_MONGODB_URI`.
+Structured snapshots, event payloads, and checkpoint continuations are stored
+as native BSON documents/arrays rather than JSON text. Readers still accept
+the earlier string-encoded format for existing records.
 
-## Local database and agent trace
+## Database and agent trace
 
-The default path is `.local/harness.sqlite`. TOML examples use the same path;
-separate example-specific database files are not needed. The `database`
-setting/CLI option remains available when a user explicitly wants isolated
-state. SQLite's `-wal` and `-shm` files are temporary sidecars, not separate
-application databases.
-
-There is no second trace database to keep synchronized. The same SQLite file
-contains the full durable trace: `steps` stores the exact model and messages
+The default MongoDB database name is `test`. There is no second trace database
+to keep synchronized. The same MongoDB database contains the full durable trace:
+`steps` stores the exact model and messages
 sent plus the accepted assistant response; `invocations` stores tool arguments,
 status, result and error; `events` stores the ordered run/task/step/tool state
 transitions. The `trace RUN_ID` CLI command combines these records, including
 private prompt and tool data, after enforcing run ownership. `runs` and `tasks`
 hold current state, `checkpoints` enables continuation, `approvals` records
 write decisions, and `artifacts` indexes workspace outputs. `task_dependencies`
-is ready for durable dependency relationships; it is currently empty when no
-multi-task coordination has been implemented.
+records child execution dependencies, and `delegations` maps parent/idempotency
+key pairs to child tasks to prevent duplicate creation after repeated requests.
 
-This trace is local but contains potentially sensitive prompts and tool data.
-Protect the database file with host permissions and avoid sharing trace output
-without reviewing it.
+This trace contains potentially sensitive prompts and tool data. Restrict
+database credentials and access, and avoid sharing trace output without reviewing it.
 
 ## Resource admission (Phase 4)
 

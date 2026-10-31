@@ -27,7 +27,7 @@ class RunService:
         now = self._clock.utc_now()
         task_id = self._ids.new_id()
         config = RunConfig(
-            "single-agent",
+            "coordinator",
             "1",
             model=options.snapshot(),
             policy=JsonObject(json.dumps({"root_task_id": task_id})),
@@ -42,7 +42,20 @@ class RunService:
             now,
             deadline=now + timedelta(seconds=options.timeout_seconds),
         )
-        task = Task(task_id, run.run_id, user_id, task_input, now, now, deadline=run.deadline)
+        capabilities = tuple(sorted(set(options.tool_allowlist)))
+        task = Task(
+            task_id,
+            run.run_id,
+            user_id,
+            task_input,
+            now,
+            now,
+            deadline=run.deadline,
+            agent_instance_id=self._ids.new_id(),
+            agent_definition_id="coordinator",
+            agent_definition_version="1",
+            capabilities=capabilities,
+        )
         async with self._store.transaction(user_id) as tx:
             await tx.create_run(run)
             await tx.create_task(task)

@@ -147,6 +147,7 @@ class RunOptions:
         "write_file",
         "search_files",
         "edit_file",
+        "delegate_tasks",
     )
     max_tool_calls: int = 8
     repeated_action_limit: int = 2

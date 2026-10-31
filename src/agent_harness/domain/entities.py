@@ -103,6 +103,14 @@ class Task:
     version: int = 0
     deadline: datetime | None = None
     result: JsonObject | None = None
+    agent_definition_id: str = "single-agent"
+    agent_definition_version: str = "1"
+    depth: int = 0
+    required: bool = True
+    capabilities: tuple[str, ...] = ()
+    handoff: JsonObject = field(default_factory=JsonObject)
+    idempotency_key: str | None = None
+    error: JsonObject | None = None
 
     def __post_init__(self) -> None:
         identifier(self.task_id)
@@ -111,6 +119,21 @@ class Task:
             bool(self.user_id.strip() and self.objective.strip()), "User and objective required"
         )
         require(self.version >= 0, "Version cannot be negative")
+        require(self.depth >= 0, "Task depth cannot be negative")
+        require(
+            bool(self.agent_definition_id.strip() and self.agent_definition_version.strip()),
+            "Agent definition and version are required",
+        )
+        require(
+            len(set(self.capabilities)) == len(self.capabilities),
+            "Task capabilities cannot contain duplicates",
+        )
+        require(
+            self.idempotency_key is None
+            or bool(self.idempotency_key.strip())
+            and len(self.idempotency_key) <= 200,
+            "Invalid task idempotency key",
+        )
         utc(self.created_at)
         utc(self.updated_at)
         require(self.updated_at >= self.created_at, "Update precedes creation")

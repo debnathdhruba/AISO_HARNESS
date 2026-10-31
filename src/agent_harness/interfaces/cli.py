@@ -57,7 +57,9 @@ def run_command(
     task: Annotated[str, typer.Option(help="Task input")],
     user: Annotated[str, typer.Option(help="Trusted-local principal")],
     provider: Annotated[str | None, typer.Option(help="fake (offline) or ollama")] = None,
-    database: Annotated[Path | None, typer.Option()] = None,
+    database_name: Annotated[
+        str | None, typer.Option(help="MongoDB database name (default: test)")
+    ] = None,
     config: Annotated[Path | None, typer.Option(help="TOML settings path")] = None,
     max_steps: Annotated[int | None, typer.Option()] = None,
     timeout: Annotated[int | None, typer.Option(help="Total run deadline in seconds")] = None,
@@ -68,7 +70,7 @@ def run_command(
     settings = load_settings(
         config,
         provider=provider,
-        database=database,
+        database_name=database_name,
         max_steps=max_steps,
         timeout_seconds=timeout,
         require_write_approval=require_write_approval,
@@ -81,15 +83,67 @@ def run_command(
         raise typer.Exit(1)
 
 
+async def chat(settings: Settings, user: str) -> None:
+    async with application(settings) as services:
+        typer.echo("Agent ready. Enter a task; type 'exit' or press Ctrl+C to stop.")
+        while True:
+            try:
+                task = input("\nYou> ").strip()
+            except EOFError:
+                break
+
+            if task.lower() in {"exit", "quit"}:
+                break
+            if not task:
+                continue
+
+            try:
+                run = await services.runs.submit(user, task, settings.run_options())
+                typer.echo(f"run_id={run.run_id}", err=True)
+                async with runner(
+                    services, settings, RunOptions.restore(run.config.model)
+                ) as agent:
+                    result = await agent.execute(user, run.run_id)
+                typer.echo(
+                    "Agent> "
+                    + json.dumps(
+                        {
+                            "status": result.status.value,
+                            "result": json.loads(result.result.text) if result.result else None,
+                            "error": json.loads(result.error.text) if result.error else None,
+                        },
+                        indent=2,
+                    )
+                )
+            except HarnessError as error:
+                typer.echo(f"Task failed: {error.message}", err=True)
+
+        typer.echo("Agent stopped.")
+
+
+@app.command("chat")
+def chat_command(
+    user: Annotated[str, typer.Option(help="Trusted-local principal")] = "local-user",
+    config: Annotated[Path, typer.Option(help="TOML settings path")] = Path("examples/ollama.toml"),
+) -> None:
+    """Run tasks in an interactive loop until exit, quit, or Ctrl+C."""
+    try:
+        asyncio.run(chat(load_settings(config), user))
+    except KeyboardInterrupt:
+        typer.echo("\nAgent stopped.")
+
+
 @app.command("continue")
 def continue_command(
     run_id: str,
     user: Annotated[str, typer.Option()],
-    database: Annotated[Path | None, typer.Option()] = None,
+    database_name: Annotated[str | None, typer.Option(help="MongoDB database name")] = None,
     config: Annotated[Path | None, typer.Option()] = None,
 ) -> None:
     """Continue an interrupted Phase 2 run using its original deadline and models."""
-    result = asyncio.run(execute(load_settings(config, database=database), user, None, run_id))
+    result = asyncio.run(
+        execute(load_settings(config, database_name=database_name), user, None, run_id)
+    )
     typer.echo(json.dumps(summary(result), indent=2))
     if result.status != RunStatus.COMPLETED:
         raise typer.Exit(1)
@@ -105,6 +159,7 @@ async def inspect_run(
             steps = await tx.steps(run_id)
             invocations = await tx.invocations(run_id)
             artifacts = await tx.artifacts(run_id)
+            tasks = await tx.tasks(run_id)
         result["invocations"] = [
             {
                 "invocation_id": i.invocation_id,
@@ -133,6 +188,23 @@ async def inspect_run(
             }
             for a in artifacts
         ]
+        result["tasks"] = [
+            {
+                "task_id": task.task_id,
+                "parent_task_id": task.parent_task_id,
+                "dependencies": task.dependencies,
+                "agent_instance_id": task.agent_instance_id,
+                "agent_definition": f"{task.agent_definition_id}@{task.agent_definition_version}",
+                "depth": task.depth,
+                "status": task.status.value,
+                "required": task.required,
+                "capabilities": task.capabilities,
+                "result": json.loads(task.result.text) if task.result else None,
+                "error": json.loads(task.error.text) if task.error else None,
+                "handoff": json.loads(task.handoff.text) if history else None,
+            }
+            for task in tasks
+        ]
         result["steps"] = [
             json.loads(encode_step(step))["data"]
             if history
@@ -157,14 +229,14 @@ async def inspect_run(
 def inspect_command(
     run_id: str,
     user: Annotated[str, typer.Option()],
-    database: Annotated[Path | None, typer.Option()] = None,
+    database_name: Annotated[str | None, typer.Option(help="MongoDB database name")] = None,
     config: Annotated[Path | None, typer.Option()] = None,
     history: Annotated[
         bool, typer.Option(help="Include private persisted prompts and responses")
     ] = False,
 ) -> None:
     value = asyncio.run(
-        inspect_run(load_settings(config, database=database), user, run_id, history)
+        inspect_run(load_settings(config, database_name=database_name), user, run_id, history)
     )
     typer.echo(json.dumps(value, indent=2))
 
@@ -173,13 +245,13 @@ def inspect_command(
 def trace_command(
     run_id: str,
     user: Annotated[str, typer.Option(help="Trusted-local principal")],
-    database: Annotated[Path | None, typer.Option()] = None,
+    database_name: Annotated[str | None, typer.Option(help="MongoDB database name")] = None,
     config: Annotated[Path | None, typer.Option()] = None,
 ) -> None:
     """Show the persisted model, tool and lifecycle trace for one run."""
 
     async def read() -> dict[str, object]:
-        settings = load_settings(config, database=database)
+        settings = load_settings(config, database_name=database_name)
         value = await inspect_run(settings, user, run_id, history=True)
         async with application(settings) as services:
             async with services.store.transaction(user) as tx:
@@ -210,11 +282,11 @@ def trace_command(
 def events_command(
     run_id: str,
     user: Annotated[str, typer.Option()],
-    database: Annotated[Path | None, typer.Option()] = None,
+    database_name: Annotated[str | None, typer.Option(help="MongoDB database name")] = None,
     after: Annotated[int, typer.Option()] = 0,
 ) -> None:
     async def read() -> list[dict[str, object]]:
-        async with application(load_settings(database=database)) as services:
+        async with application(load_settings(database_name=database_name)) as services:
             await services.runs.inspect(user, run_id)
             async with services.store.transaction(user) as tx:
                 events = await tx.events(run_id, after=after)
@@ -231,10 +303,10 @@ def events_command(
 
 
 def approval_command(
-    invocation_id: str, user: str, digest: str, database: Path | None, approve: bool
+    invocation_id: str, user: str, digest: str, database_name: str | None, approve: bool
 ) -> None:
     async def decide() -> None:
-        async with application(load_settings(database=database)) as services:
+        async with application(load_settings(database_name=database_name)) as services:
             await decide_approval(services.store, user, invocation_id, digest, approve)
 
     asyncio.run(decide())
@@ -246,10 +318,10 @@ def approve_command(
     invocation_id: str,
     user: Annotated[str, typer.Option()],
     argument_hash: Annotated[str, typer.Option()],
-    database: Annotated[Path | None, typer.Option()] = None,
+    database_name: Annotated[str | None, typer.Option(help="MongoDB database name")] = None,
 ) -> None:
     """Approve the exact invocation and argument hash shown by inspect."""
-    approval_command(invocation_id, user, argument_hash, database, True)
+    approval_command(invocation_id, user, argument_hash, database_name, True)
 
 
 @app.command("deny")
@@ -257,10 +329,10 @@ def deny_command(
     invocation_id: str,
     user: Annotated[str, typer.Option()],
     argument_hash: Annotated[str, typer.Option()],
-    database: Annotated[Path | None, typer.Option()] = None,
+    database_name: Annotated[str | None, typer.Option(help="MongoDB database name")] = None,
 ) -> None:
     """Deny an invocation; continuation feeds the denial back to the agent."""
-    approval_command(invocation_id, user, argument_hash, database, False)
+    approval_command(invocation_id, user, argument_hash, database_name, False)
 
 
 def main() -> None:

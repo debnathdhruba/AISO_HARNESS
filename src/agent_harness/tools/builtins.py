@@ -4,6 +4,7 @@ import math
 import operator
 from collections.abc import Callable
 from pathlib import Path
+from collections.abc import Awaitable
 
 from agent_harness.artifacts.service import ArtifactService
 from agent_harness.domain.entities import JsonObject
@@ -65,7 +66,10 @@ def calculate(expression: str) -> int | float:
 
 
 def builtin_registry(
-    artifacts: ArtifactService, workspace: Path, artifact_root: Path
+    artifacts: ArtifactService,
+    workspace: Path,
+    artifact_root: Path,
+    delegate: Callable[[Invocation], Awaitable[JsonObject]] | None = None,
 ) -> ToolRegistry:
     text = {"type": "string", "maxLength": 4096}
     output = JsonObject('{"type":"object"}')
@@ -103,8 +107,7 @@ def builtin_registry(
         args = json.loads(invocation.arguments.text)
         return await files.edit(invocation, args["path"], args["old_text"], args["new_text"])
 
-    return ToolRegistry(
-        (
+    tools = [
             RegisteredTool(
                 ToolSpec(
                     "calculator",
@@ -210,5 +213,76 @@ def builtin_registry(
                 ),
                 edit_file,
             ),
+    ]
+    if delegate is not None:
+        tools.append(
+            RegisteredTool(
+                ToolSpec(
+                    "delegate_tasks",
+                    "1",
+                    "Delegate a bounded batch of explicit tasks to registered child agents. "
+                    "Dependencies use aliases from this batch.",
+                    schema(
+                        {
+                            "tasks": {
+                                "type": "array",
+                                "minItems": 1,
+                                "maxItems": 8,
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "alias": {"type": "string", "minLength": 1, "maxLength": 64},
+                                        "idempotency_key": {
+                                            "type": "string",
+                                            "minLength": 1,
+                                            "maxLength": 200,
+                                        },
+                                        "agent_definition_id": {
+                                            "type": "string",
+                                            "enum": ["coordinator", "researcher", "writer"],
+                                        },
+                                        "agent_version": {"type": "string", "maxLength": 20},
+                                        "objective": {
+                                            "type": "string",
+                                            "minLength": 1,
+                                            "maxLength": 4096,
+                                        },
+                                        "acceptance_criteria": {"type": "object"},
+                                        "input_artifact_ids": {
+                                            "type": "array",
+                                            "items": {"type": "string", "maxLength": 64},
+                                            "maxItems": 16,
+                                        },
+                                        "dependencies": {
+                                            "type": "array",
+                                            "items": {"type": "string", "maxLength": 64},
+                                            "maxItems": 8,
+                                        },
+                                        "capabilities": {
+                                            "type": "array",
+                                            "items": {"type": "string", "maxLength": 64},
+                                            "maxItems": 16,
+                                        },
+                                        "max_steps": {"type": "integer", "minimum": 1, "maximum": 100},
+                                    },
+                                    "required": [
+                                        "alias",
+                                        "idempotency_key",
+                                        "agent_definition_id",
+                                        "objective",
+                                    ],
+                                    "additionalProperties": False,
+                                },
+                            }
+                        },
+                        ["tasks"],
+                    ),
+                    output,
+                    effect=Effect.IDEMPOTENT_WRITE,
+                    idempotency="invocation_id",
+                    supports_reconciliation=True,
+                ),
+                delegate,
+            )
         )
-    )
+    return ToolRegistry(tuple(tools))
