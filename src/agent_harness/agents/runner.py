@@ -22,10 +22,15 @@ from agent_harness.domain.model import (
 )
 from agent_harness.domain.states import RUN_TRANSITIONS, ControlIntent, RunStatus, TaskStatus
 from agent_harness.domain.tooling import ToolSpec
-from agent_harness.llm import RouteAction, RouterDecision, RouterWorkerPipeline
+from agent_harness.llm import (
+    RouteAction,
+    RouterAnswerStreamer,
+    RouterDecision,
+    RouterWorkerPipeline,
+)
 from agent_harness.memory import MemoryService, render_memory_context
 from agent_harness.models.context import build_context, tool_schema_size
-from agent_harness.ports.model import ModelClient
+from agent_harness.ports.model import ModelClient, StreamingModelClient, TokenCallback
 from agent_harness.ports.state import Clock, IdGenerator, StateStore, StateTransaction
 from agent_harness.tools.executor import ToolExecutor
 
@@ -79,20 +84,28 @@ class AgentRunner:
         self._run_locks: dict[tuple[str, str], tuple[asyncio.Lock, int]] = {}
         self._run_locks_guard = asyncio.Lock()
 
-    async def execute(self, user_id: str, run_id: str) -> Run:
-        return await self._execute_locked(user_id, run_id, None)
+    async def execute(
+        self, user_id: str, run_id: str, *, on_token: TokenCallback | None = None
+    ) -> Run:
+        return await self._execute_locked(user_id, run_id, None, on_token)
 
     async def execute_task(self, user_id: str, run_id: str, task_id: str) -> Run:
-        return await self._execute_locked(user_id, run_id, task_id)
+        return await self._execute_locked(user_id, run_id, task_id, None)
 
-    async def _execute_locked(self, user_id: str, run_id: str, task_id: str | None) -> Run:
+    async def _execute_locked(
+        self,
+        user_id: str,
+        run_id: str,
+        task_id: str | None,
+        on_token: TokenCallback | None,
+    ) -> Run:
         lock_key = (run_id, task_id or "root")
         async with self._run_locks_guard:
             lock, users = self._run_locks.get(lock_key, (asyncio.Lock(), 0))
             self._run_locks[lock_key] = (lock, users + 1)
         try:
             async with lock:
-                return await self._execute(user_id, run_id, task_id)
+                return await self._execute(user_id, run_id, task_id, on_token)
         finally:
             async with self._run_locks_guard:
                 current, users = self._run_locks[lock_key]
@@ -300,7 +313,13 @@ class AgentRunner:
             await self._checkpoint(tx, updated, task_id)
             return updated
 
-    async def _execute(self, user_id: str, run_id: str, requested_task_id: str | None) -> Run:
+    async def _execute(
+        self,
+        user_id: str,
+        run_id: str,
+        requested_task_id: str | None,
+        on_token: TokenCallback | None,
+    ) -> Run:
         async with self._store.transaction(user_id) as tx:
             run = await tx.get_run(run_id)
             if run is None:
@@ -380,15 +399,14 @@ class AgentRunner:
         monotonic_end = self._clock.monotonic() + max(
             0, (run.deadline - self._clock.utc_now()).total_seconds()
         )
+        streamed_router_answer_steps: set[str] = set()
         while True:
             if self._ownership_check is not None:
                 await self._ownership_check()
             async with self._store.transaction(user_id) as tx:
                 current = await tx.get_run(run_id)
                 steps = await tx.steps(run_id, task_id)
-                invocations = tuple(
-                    item for item in await tx.invocations(run_id) if item.task_id == task_id
-                )
+                invocations = await tx.invocations(run_id, task_id)
             succeeded = {i.tool_name for i in invocations if i.status.value == "succeeded"}
             outstanding_tools = tuple(
                 name for name in options.required_tools if name not in succeeded
@@ -593,6 +611,13 @@ class AgentRunner:
                             await self._checkpoint(tx, current, task_id, applied)
                         continue
                     final_answer = router_decision.answer
+                    if (
+                        on_token is not None
+                        and latest.stage == Stage.ROUTER
+                        and latest.step_id not in streamed_router_answer_steps
+                    ):
+                        assert final_answer is not None
+                        await on_token(final_answer)
                 else:
                     final_answer = response.message.content
                 if latest.stage == Stage.RESPONSE or (
@@ -1036,7 +1061,39 @@ class AgentRunner:
                 await tx.create_step(step)
             try:
                 async with asyncio.timeout(remaining):
-                    response = await self._model.generate(request)
+                    if (
+                        on_token is not None
+                        and router_worker
+                        and stage == Stage.ROUTER
+                        and not outstanding_tools
+                    ):
+                        streamer = RouterAnswerStreamer(on_token)
+
+                        async def stream_router_chunk(
+                            content: str,
+                            current_streamer: RouterAnswerStreamer = streamer,
+                            current_step_id: str = step.step_id,
+                        ) -> None:
+                            await current_streamer.feed(content)
+                            if current_streamer.has_output:
+                                streamed_router_answer_steps.add(current_step_id)
+
+                        if isinstance(self._model, StreamingModelClient):
+                            response = await self._model.generate_stream(
+                                request, stream_router_chunk
+                            )
+                        else:
+                            response = await self._model.generate(request)
+                            await stream_router_chunk(response.message.content)
+                    elif on_token is not None and stage == Stage.RESPONSE:
+                        if isinstance(self._model, StreamingModelClient):
+                            response = await self._model.generate_stream(request, on_token)
+                        else:
+                            response = await self._model.generate(request)
+                            if response.message.content:
+                                await on_token(response.message.content)
+                    else:
+                        response = await self._model.generate(request)
             except (HarnessError, TimeoutError, asyncio.CancelledError) as caught:
                 error = (
                     caught

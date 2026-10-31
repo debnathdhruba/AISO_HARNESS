@@ -120,7 +120,12 @@ async def runner(
         if options.provider == "fake":
             client = offline_model()
         else:
-            ollama = await stack.enter_async_context(OllamaClient(base_url=settings.ollama_url))
+            ollama = await stack.enter_async_context(
+                OllamaClient(
+                    base_url=settings.ollama_url,
+                    max_connections=settings.model_provider_concurrency,
+                )
+            )
             client = ollama
         agent_holder: dict[str, AgentRunner] = {}
 

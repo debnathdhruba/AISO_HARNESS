@@ -15,6 +15,7 @@ from agent_harness.domain.memory import MemoryRecord, MemorySharing
 from agent_harness.domain.model import RunOptions
 from agent_harness.domain.states import ControlIntent, RunStatus
 from agent_harness.models.codec import encode_step
+from agent_harness.ports.model import TokenCallback
 from agent_harness.tools.executor import decide_approval
 
 app = typer.Typer(no_args_is_help=True, help="Standalone agent harness: offline or local Ollama.")
@@ -54,7 +55,13 @@ def parse_tags(value: str) -> tuple[str, ...]:
     return tuple(tag.strip() for tag in value.split(",") if tag.strip())
 
 
-async def execute(settings: Settings, user: str, task: str | None, run_id: str | None) -> Run:
+async def execute(
+    settings: Settings,
+    user: str,
+    task: str | None,
+    run_id: str | None,
+    on_token: TokenCallback | None = None,
+) -> Run:
     async with application(settings, own_scheduler=True) as services:
         if run_id is None:
             assert task is not None
@@ -73,7 +80,7 @@ async def execute(settings: Settings, user: str, task: str | None, run_id: str |
         }:
             return run
         async with runner(services, settings, RunOptions.restore(run.config.model)) as agent:
-            return await agent.execute(user, run.run_id)
+            return await agent.execute(user, run.run_id, on_token=on_token)
 
 
 @app.command("run")
@@ -103,7 +110,20 @@ def run_command(
         workspace=workspace,
         routing_mode=mode,
     )
-    result = asyncio.run(execute(settings, user, task, None))
+    streamed = False
+
+    async def stream_token(token: str) -> None:
+        nonlocal streamed
+        if not streamed:
+            typer.echo("Agent> ", nl=False, err=True)
+            streamed = True
+        typer.echo(token, nl=False, err=True)
+
+    result = asyncio.run(
+        execute(settings, user, task, None, stream_token if settings.provider == "ollama" else None)
+    )
+    if streamed:
+        typer.echo(err=True)
     typer.echo(json.dumps(summary(result), indent=2))
     if result.status != RunStatus.COMPLETED:
         raise typer.Exit(1)
@@ -112,37 +132,63 @@ def run_command(
 async def chat(settings: Settings, user: str) -> None:
     async with application(settings, own_scheduler=True) as services:
         typer.echo("Agent ready. Enter a task; type 'exit' or press Ctrl+C to stop.")
-        while True:
-            try:
-                task = input("\nYou> ").strip()
-            except EOFError:
-                break
+        options = settings.run_options()
+        async with runner(services, settings, options) as agent:
+            while True:
+                try:
+                    task = input("\nYou> ").strip()
+                except EOFError:
+                    break
 
-            if task.lower() in {"exit", "quit"}:
-                break
-            if not task:
-                continue
+                if task.lower() in {"exit", "quit"}:
+                    break
+                if not task:
+                    continue
 
-            try:
-                run = await services.runs.submit(user, task, settings.run_options())
-                typer.echo(f"run_id={run.run_id}", err=True)
-                async with runner(
-                    services, settings, RunOptions.restore(run.config.model)
-                ) as agent:
-                    result = await agent.execute(user, run.run_id)
-                typer.echo(
-                    "Agent> "
-                    + json.dumps(
-                        {
-                            "status": result.status.value,
-                            "result": json.loads(result.result.text) if result.result else None,
-                            "error": json.loads(result.error.text) if result.error else None,
-                        },
-                        indent=2,
+                try:
+                    run = await services.runs.submit(user, task, options)
+                    typer.echo(f"run_id={run.run_id}", err=True)
+                    streamed = False
+
+                    async def stream_token(token: str) -> None:
+                        nonlocal streamed
+                        if not streamed:
+                            typer.echo("Agent> ", nl=False)
+                            streamed = True
+                        typer.echo(token, nl=False)
+
+                    result = await agent.execute(
+                        user,
+                        run.run_id,
+                        on_token=(stream_token if settings.provider == "ollama" else None),
                     )
-                )
-            except HarnessError as error:
-                typer.echo(f"Task failed: {error.message}", err=True)
+                    if streamed:
+                        typer.echo()
+                        if result.status != RunStatus.COMPLETED:
+                            typer.echo(f"Run status: {result.status.value}", err=True)
+                        if result.error is not None:
+                            typer.echo(
+                                f"Task failed: {json.loads(result.error.text)['message']}",
+                                err=True,
+                            )
+                    else:
+                        typer.echo(
+                            "Agent> "
+                            + json.dumps(
+                                {
+                                    "status": result.status.value,
+                                    "result": (
+                                        json.loads(result.result.text) if result.result else None
+                                    ),
+                                    "error": (
+                                        json.loads(result.error.text) if result.error else None
+                                    ),
+                                },
+                                indent=2,
+                            )
+                        )
+                except HarnessError as error:
+                    typer.echo(f"Task failed: {error.message}", err=True)
 
         typer.echo("Agent stopped.")
 

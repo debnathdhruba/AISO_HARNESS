@@ -15,7 +15,6 @@ dependencies = [
     "python-dotenv>=1,<2",
     "typer",
     "jsonschema",
-    "pytest>=9.2.0",
 ]
 
 [project.scripts]

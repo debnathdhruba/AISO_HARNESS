@@ -184,12 +184,14 @@ class SQLiteTransaction:
         if user_id != self._user:
             raise HarnessError(ErrorCode.AUTHORIZATION, "Principal does not own this object")
 
-    async def invocations(self, run_id: str) -> tuple[Invocation, ...]:
+    async def invocations(self, run_id: str, task_id: str | None = None) -> tuple[Invocation, ...]:
         self.check_active()
-        async with self._db.execute(
-            "SELECT snapshot FROM invocations WHERE run_id=? AND user_id=? ORDER BY rowid",
-            (run_id, self._user),
-        ) as cursor:
+        query = "SELECT snapshot FROM invocations WHERE run_id=? AND user_id=?"
+        parameters: tuple[str, ...] = (run_id, self._user)
+        if task_id is not None:
+            query += " AND task_id=?"
+            parameters += (task_id,)
+        async with self._db.execute(query + " ORDER BY rowid", parameters) as cursor:
             return tuple(decode_invocation(str(row[0])) for row in await cursor.fetchall())
 
     async def get_invocation(self, invocation_id: str) -> Invocation | None:

@@ -11,7 +11,7 @@ from functools import wraps
 from typing import Any, Concatenate, ParamSpec, TypeVar
 from uuid import uuid4
 
-from pymongo import ASCENDING, DESCENDING, AsyncMongoClient, ReturnDocument
+from pymongo import ASCENDING, DESCENDING, AsyncMongoClient, IndexModel, ReturnDocument
 from pymongo.asynchronous.client_session import AsyncClientSession
 from pymongo.errors import DuplicateKeyError, PyMongoError
 
@@ -546,19 +546,18 @@ class MongoStore:
                 ("updated_at", DESCENDING),
             ),
         }
+        unique_compound = {
+            "task_dependencies",
+            "steps",
+            "artifacts",
+            "delegations",
+            "events",
+            "invocations",
+        }
+        indexes: dict[str, list[IndexModel]] = {}
         for collection_name, keys in definitions.items():
-            collection = self._database[collection_name]
-            await collection.create_index(
-                list(keys),
-                unique=collection_name
-                in {
-                    "task_dependencies",
-                    "steps",
-                    "artifacts",
-                    "delegations",
-                    "events",
-                    "invocations",
-                },
+            indexes.setdefault(collection_name, []).append(
+                IndexModel(list(keys), unique=collection_name in unique_compound)
             )
         for collection_name, field in (
             ("events", "event_id"),
@@ -570,10 +569,29 @@ class MongoStore:
             ("artifacts", "artifact_id"),
             ("checkpoints", "task_id"),
         ):
-            await self._database[collection_name].create_index(field, unique=True)
-        await self._database["delegations"].create_index("child_task_id", unique=True)
-        await self._database["budget_accounts"].create_index("task_id", unique=True)
-        await self._database["budget_reservations"].create_index("reservation_id", unique=True)
+            indexes.setdefault(collection_name, []).append(IndexModel(field, unique=True))
+        for collection_name, field in (
+            ("delegations", "child_task_id"),
+            ("budget_accounts", "task_id"),
+            ("budget_reservations", "reservation_id"),
+        ):
+            indexes.setdefault(collection_name, []).append(IndexModel(field, unique=True))
+        indexes["invocations"].append(
+            IndexModel(
+                [
+                    ("user_id", ASCENDING),
+                    ("run_id", ASCENDING),
+                    ("task_id", ASCENDING),
+                ],
+                name="invocations_user_run_task",
+            )
+        )
+        await asyncio.gather(
+            *(
+                self._database[collection_name].create_indexes(collection_indexes)
+                for collection_name, collection_indexes in indexes.items()
+            )
+        )
 
     @asynccontextmanager
     async def transaction(self, user_id: str) -> AsyncGenerator[StateTransaction, None]:
@@ -1279,10 +1297,13 @@ class MongoTransaction:
             details=decision,
         )
 
-    async def invocations(self, run_id: str) -> tuple[Invocation, ...]:
+    async def invocations(self, run_id: str, task_id: str | None = None) -> tuple[Invocation, ...]:
+        query: dict[str, object] = {"run_id": run_id, "user_id": self._user}
+        if task_id is not None:
+            query["task_id"] = task_id
         return tuple(
             decode_invocation(_snapshot_text(row["snapshot"], INVOCATION_JSON_PATHS))
-            for row in await self._find("invocations", {"run_id": run_id, "user_id": self._user})
+            for row in await self._find("invocations", query)
         )
 
     async def get_invocation(self, invocation_id: str) -> Invocation | None:

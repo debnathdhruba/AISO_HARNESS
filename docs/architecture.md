@@ -66,6 +66,10 @@ an individual tool. Coordinators can create bounded worker tasks through the
 factory/coordinator path; independent children run concurrently within the
 configured task and model-provider limits. `delegate_tasks` retains its v1
 contract for persisted calls and exposes the worker profile through v2.
+Ollama responses can stream through the model gateway to the CLI; only the
+final answer is emitted, keeping tool calls and intermediate drafts private.
+The interactive CLI keeps one Ollama HTTP client open across turns, and its
+connection-pool size follows the configured provider concurrency.
 Phase 4 implements in-process model, tool, artifact and memory admission lanes:
 queues reject excess work explicitly, model requests are capped per provider, and
 capacity snapshots expose active and queued counts. The blocking-tool adapter

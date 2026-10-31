@@ -1,11 +1,13 @@
 """Gemma routing decisions and compact LFM tool-worker handoffs."""
 
 import json
+import re
 from dataclasses import dataclass
 from enum import StrEnum
 
 from agent_harness.domain.errors import ErrorCode, HarnessError, require
 from agent_harness.domain.tooling import ToolSpec
+from agent_harness.ports.model import TokenCallback
 
 
 class RouteAction(StrEnum):
@@ -19,6 +21,56 @@ class RouterDecision:
     answer: str | None = None
     tool_name: str | None = None
     context: str | None = None
+
+
+class RouterAnswerStreamer:
+    """Stream only the answer string from the router's expected JSON shape."""
+
+    _prefix = re.compile(r'\s*\{\s*"action"\s*:\s*"answer"\s*,\s*"answer"\s*:\s*"')
+
+    def __init__(self, on_token: TokenCallback) -> None:
+        self._on_token = on_token
+        self._content = ""
+        self._emitted = ""
+        self.has_output = False
+
+    async def feed(self, chunk: str) -> None:
+        self._content += chunk
+        prefix = self._prefix.match(self._content)
+        if prefix is None:
+            return
+
+        escaped = False
+        end = len(self._content)
+        complete = False
+        for index in range(prefix.end(), len(self._content)):
+            char = self._content[index]
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                end = index
+                complete = True
+                break
+
+        raw_answer = self._content[prefix.end() : end]
+        if escaped:
+            raw_answer = raw_answer[:-1]
+        try:
+            decoded = json.loads(f'"{raw_answer}"')
+        except json.JSONDecodeError:
+            return
+        if not complete and decoded and 0xD800 <= ord(decoded[-1]) <= 0xDBFF:
+            decoded = decoded[:-1]
+        decoded = decoded.encode("utf-16-le", "surrogatepass").decode("utf-16-le", "replace")
+        if not decoded.startswith(self._emitted):
+            return
+        token = decoded[len(self._emitted) :]
+        if token:
+            self._emitted = decoded
+            self.has_output = True
+            await self._on_token(token)
 
 
 class RouterWorkerPipeline:
