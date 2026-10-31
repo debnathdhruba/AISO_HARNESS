@@ -54,8 +54,7 @@ class MemoryRecord:
             isinstance(self.tags, tuple)
             and len(self.tags) <= 20
             and all(
-                isinstance(tag, str) and bool(tag.strip()) and len(tag) <= 80
-                for tag in self.tags
+                isinstance(tag, str) and bool(tag.strip()) and len(tag) <= 80 for tag in self.tags
             )
             and len(set(self.tags)) == len(self.tags),
             "Memory tags must be unique non-empty strings of at most 80 characters",
