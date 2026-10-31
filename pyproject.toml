@@ -5,10 +5,13 @@ build-backend = "hatchling.build"
 [project]
 name = "agent-harness"
 version = "0.1.0"
-description = "Standalone durable agent harness (Phase 0 foundation)"
+description = "Standalone durable agent harness"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = ["aiosqlite", "httpx", "pydantic>=2,<3", "typer"]
+
+[project.scripts]
+agent-harness = "agent_harness.interfaces.cli:main"
 
 [project.optional-dependencies]
 dev = ["hatchling", "mypy", "pytest", "pytest-asyncio", "ruff"]

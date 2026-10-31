@@ -43,7 +43,8 @@ No domain imports of SQLite, configuration singletons, transport frameworks or
 provider SDKs. No mutable global queues or implicit current user. Model output
 cannot confer authorization. Ruff bans reference-framework imports, and the
 foundation test audits all package source imports. Add layer-specific enforcement
-when the corresponding layers actually exist in Phase 1; no empty layers now.
+when layers exist. Phase 1 now enforces domain/port imports with an AST boundary
+test: only standard library and domain imports are permitted.
 
 The runner advances one bounded decision; the coordinator owns dependencies and
 child relationships. Task admission is round-robin across runs, FIFO within runs.
@@ -65,4 +66,6 @@ within the same user. Artifact access must enforce workspace and symlink bounds.
 
 Known end-state limits: trusted in-process tools, single-host SQLite ownership,
 non-preemptive operations, uncertain provider usage and no universal exactly-once
-external effects. Phase 0 implements none of these runtime guarantees yet.
+external effects. Phase 1 implements the durable state foundation described in
+[durable-state.md](durable-state.md); scheduling, budget enforcement, completion
+policy, effect reconciliation and process ownership remain future work.

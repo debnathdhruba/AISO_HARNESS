@@ -1,14 +1,15 @@
 # Phase tracker
 
-Only Phase 0 has implementation authorization. Phase 0 checks passed on Windows
-with Python 3.11.15; architecture review and approval of Phase 1 are pending.
-See [the review handoff](reviews/phase-00.md) for evidence and limitations.
+Phase 1 was explicitly authorized by the user and is complete. Its checks passed
+on Windows with Python 3.11.15: 39 tests, Ruff lint/format and strict mypy.
+See [the Phase 1 review handoff](reviews/phase-01.md) for evidence and limitations.
+Phase 2 is not authorized and has not started.
 
 | Phase | Scope | Status |
 | --- | --- | --- |
-| 0 | Architecture and project foundation | Complete; ready for human review |
-| 1 | Domain contracts and durable state foundation | Not started; awaiting approval |
-| 2 | Model gateway and single-agent reasoning loop | Not started |
+| 0 | Architecture and project foundation | Complete; advancement approved |
+| 1 | Domain contracts and durable state foundation | Complete; ready for human review |
+| 2 | Model gateway and single-agent reasoning loop | Not started; awaiting approval |
 | 3 | Tool loop, policies and local artifacts | Not started |
 | 4 | Resource scheduler and concurrency controls | Not started |
 | 5 | Agent factory and durable task coordination | Not started |
@@ -21,5 +22,6 @@ See [the review handoff](reviews/phase-00.md) for evidence and limitations.
 Each phase ends with checks and its own review document. Do not advance without
 explicit human approval, per implementation.md sections 1 and 16. The requested
 project location is AIOS_HARNESS. Implement code before tests; give installation
-commands to the user to execute. No installation commands were run during the
-verification follow-up.
+commands to the user to execute. For Phase 1, the user explicitly authorized the
+requested `uv sync --extra dev --python 3.11` command, which installed aiosqlite
+0.22.1 and updated the lockfile. That approval does not authorize future installs.

@@ -54,3 +54,31 @@ Resolve released tooling against Python 3.11 using uv; commit uv.lock rather tha
 guessing dependency versions. Include Hatchling in the development lock so build
 tooling is recorded too. Runtime dependencies remain empty until used. The locked
 workflow is canonical; unpinned pip editable installation remains supported.
+
+## ADR-008: Phase 1 durable state boundary
+
+Phase 1 is now authorized and implements RunConfig, Run, Task, Event and
+Checkpoint. Other entities arrive when consumed by later phases. UUID strings
+identify durable objects; user identity is an explicit nonempty principal string
+so trusted-local identities such as `local-user` remain valid. Frozen dataclasses
+and canonical immutable JSON snapshots prevent accidental in-place mutation.
+Field-specific configuration validation comes with the corresponding services.
+
+Use one connection per store and one coroutine owner per unit of work. Reads and
+writes both use the same scoped transaction interface; no raw connection escapes.
+Commit on successful context exit; rollback on exception or cancellation. Any
+failed mutation poisons the transaction even if its exception is caught, avoiding
+partial state without its event. No model/tool/queue waits belong inside a UoW.
+
+Runs/tasks use optimistic versions; checkpoints have an independent revision and
+reference a task state version plus a durable event cursor. Event payloads contain
+only authored status, intent and version metadata. Database snapshots themselves
+are private state, not redacted logs. Append-only events are enforced by triggers.
+
+Two schema migrations establish the base tables and then add indexed-row control
+intent storage; an existing version-1 fixture verifies upgrade and data retention.
+This does not introduce scheduling or process leadership. Unknown invocation
+outcomes permit only reconciliation to succeeded/failed, never automatic execution.
+Blocked tasks are terminal; paused tasks return to pending for dependency evaluation.
+Retries are not implemented and cannot reopen terminal records. A later retry
+feature must add separate attempt records instead of resetting versions/status.

@@ -1,0 +1,9 @@
+provider = "ollama"
+database = ".local/ollama.sqlite"
+ollama_url = "http://127.0.0.1:11434"
+decision_model = "lfm2.5-thinking:1.2b"
+response_model = "gemma3:1b"
+max_steps = 2
+timeout_seconds = 180
+max_output_tokens = 1024
+max_input_bytes = 16384
