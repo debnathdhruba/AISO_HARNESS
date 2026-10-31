@@ -1,8 +1,13 @@
 # Architecture and boundaries
 
-This is the target architecture, not implemented runtime behavior. The governing
-specification is `../implementation.md` relative to the project root. The user's
-directory instruction overrides its proposed `agent-harness/` directory name.
+This document summarizes the intended architecture and current implementation
+boundaries; see `progress.md` for phase status. The governing specification is
+`../implementation.md` relative to the project root. The user's directory
+instruction overrides its proposed `agent-harness/` directory name.
+AIOS is an architectural reference only: its responsibilities are reimplemented
+here against standalone contracts. Do not copy, vendor, import, or run AIOS or
+Cerebrum components. MongoDB is used for durable runtime state as separately
+requested by the user; the specification's original SQLite choice was replaced.
 
 ```text
 CLI / HTTP -> application services -> run controller
@@ -77,8 +82,31 @@ absolute/traversal paths and symlink/reparse-point components, use bounded
 UTF-8 text, and keep search results capped. File edits replace one exact match
 and fail if it is missing or ambiguous; writes remain non-read-only effects.
 
-known end-state limits: trusted in-process tools, single-service ownership,
+Known end-state limits: trusted in-process tools, single-service ownership,
 non-preemptive operations, uncertain provider usage and no universal exactly-once
-external effects. Phase 1 implements the durable state foundation described in
-[durable-state.md](durable-state.md); scheduling, budget enforcement, completion
-policy, effect reconciliation and process ownership remain future work.
+external effects. Phase 7 implements process ownership and startup recovery; its
+MongoDB lease and transaction behavior have not been verified against a live
+deployment.
+
+## AIOS reference alignment (Phases 4–7)
+
+The reference checkout at `..\AIOS\aios` was inspected to map component
+responsibilities. The current harness is an independent implementation, not a
+port of the reference code. The AIOS components use synchronous/threaded
+syscalls and, in places, Cerebrum or PyOpenAGI APIs; those dependencies and
+execution assumptions are intentionally not carried into this project.
+
+| AIOS reference responsibility | AIOS component inspected | Standalone harness implementation | Deliberate difference |
+| --- | --- | --- | --- |
+| Schedule model, memory, storage, and tool requests | `aios/scheduler/base.py`, `aios/scheduler/fifo_scheduler.py`, `aios/scheduler/rr_scheduler.py` | `scheduling/resources.py:ResourceScheduler`; `agents/scheduler.py:TaskScheduler` | Separate bounded async resource admission from fair child-task scheduling. No AIOS generation time-slicing or worker-thread request queues. |
+| Create and activate agents | `aios/syscall/factory.py:AgentFactory` | `agents/factory.py:AgentRegistry` and `AgentFactory`; `application/coordinator.py` | Versioned local definitions and durable task-scoped instances; no remote marketplace loading or downloading. |
+| Dispatch tool calls | `aios/tool/manager.py:ToolManager` | `tools/registry.py:ToolRegistry` and `tools/executor.py:ToolExecutor` | Validated and authorized registered tools with persisted invocation state, approvals, and uncertain-effect reconciliation; no implicit MCP subprocess startup. |
+| Store agent artifacts | `aios/storage/storage.py:StorageManager` | `artifacts/service.py:ArtifactService`, with durable metadata in MongoDB | Workspace-scoped artifacts and manifests/checksums; not the reference LSFS/Cerebrum storage response path. |
+| Route memory operations | `aios/memory/manager.py:MemoryManager` and scheduler memory lane | `memory/service.py:MemoryService`, `memory/retrieval.py`, MongoDB `memory_records`, and `scheduling/resources.py:ResourceKind.MEMORY` | Phase 8 adds MongoDB-backed user/agent-scoped memory with deterministic lexical retrieval and a semantic-provider port; no vector database is required. |
+| Budget, completion, restart recovery, and process ownership | No direct equivalent was identified in the inspected scheduler/factory/storage/tool/memory components | MongoDB budget accounts/reservations and completion events in `persistence/mongo.py`; ownership/recovery/checkpoints in the same store; policies in `application/completion.py` | These are harness durability and safety extensions, not copied AIOS components. |
+
+Phase mapping: Phase 4 uses the scheduler responsibilities; Phase 5 uses local
+factory/registry and task-coordination responsibilities; Phase 6 adds the
+budget/completion mechanisms; Phase 7 adds durable ownership and recovery.
+`implementation.md` remains the governing phase contract. The harness must
+continue to satisfy its standalone and no-vendoring requirements.

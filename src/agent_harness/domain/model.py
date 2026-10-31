@@ -166,6 +166,10 @@ class RunOptions:
     partial_result_policy: str = "fail"
     required_artifacts: tuple[str, ...] = ()
     result_schema: JsonObject = JsonObject()
+    memory_retrieval_enabled: bool = False
+    memory_extraction_enabled: bool = False
+    memory_retrieval_limit: int = 5
+    memory_context_bytes: int = 2048
 
     def __post_init__(self) -> None:
         require(self.provider in {"fake", "ollama"}, "Unsupported provider")
@@ -187,6 +191,15 @@ class RunOptions:
         require(
             all(bool(name.strip()) for name in self.required_artifacts),
             "Required artifact names cannot be empty",
+        )
+        require(
+            1 <= self.memory_retrieval_limit <= 20 and 128 <= self.memory_context_bytes <= 16384,
+            "Invalid memory retrieval limits",
+        )
+        require(
+            isinstance(self.memory_retrieval_enabled, bool)
+            and isinstance(self.memory_extraction_enabled, bool),
+            "Memory settings must be explicit booleans",
         )
         require(
             set(self.required_tools) <= set(self.tool_allowlist), "Required tools must be permitted"
@@ -223,4 +236,8 @@ class RunOptions:
         data.setdefault("max_retries", 0)
         data.setdefault("max_corrections", 1)
         data.setdefault("partial_result_policy", "fail")
+        data.setdefault("memory_retrieval_enabled", False)
+        data.setdefault("memory_extraction_enabled", False)
+        data.setdefault("memory_retrieval_limit", 5)
+        data.setdefault("memory_context_bytes", 2048)
         return cls(**data)

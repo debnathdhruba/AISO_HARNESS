@@ -71,6 +71,7 @@ at safe execution boundaries; cancellation intent cannot be revoked.
 | budget_accounts | task UUID; run/user index | Hierarchical limits, used/reserved totals, unknown usage count |
 | budget_reservations | reservation UUID; run/task/status index | Idempotent per-operation reservation and reconciliation state |
 | process_ownership | fixed scheduler lease ID | Expiring scheduler owner lease, process ID, and heartbeat |
+| memory_records | record UUID; user/deletion/sharing/owner/update index | User-scoped private/shared facts, retrieval tags, provenance and soft deletion |
 
 Collections and indexes are ensured at application startup; MongoDB has no
 SQLite-style numbered schema migrations here. Existing local SQLite databases
@@ -221,3 +222,34 @@ The API enforces principal scope but is not an authentication service. MongoDB
 lease behavior, transaction fencing, and restart semantics have not been
 validated against a live deployment. Atlas transaction behavior and
 cross-process budget admission remain unverified.
+
+## User memory and context (Phase 8)
+
+`memory_records` is the MongoDB-only durable store for selected facts. Each
+record has a user, owning agent definition, private/shared policy, tags,
+optional run/task provenance, creation/update timestamps, and soft-deletion
+timestamp. Private reads require the same user and owner definition; shared
+reads may cross agent definitions but never users. Only the owning definition
+may update or delete a record. Direct ID lookup uses the same filters as search,
+so IDs do not bypass scope checks.
+
+`MemoryService` uses a deterministic lexical retriever behind a provider
+protocol. Retrieval is bounded to 200 scoped candidates, 20 results and a
+configured rendered-context byte budget. The resource scheduler's memory lane
+admits reads and writes. Embedding/semantic retrieval is an extension point;
+this phase does not require a vector database.
+
+Memory extraction defaults off. When enabled for a run, the `memory_save` tool
+is exposed with instructions to save only when the user explicitly asks the
+agent to remember something. The caller must choose `private` or `shared`;
+shared facts are still scoped to the same user. The tool uses its durable
+invocation ID as the memory record ID, so a replay after a crash does not
+duplicate a saved fact. No automatic extraction of all conversation text,
+tool output, credentials or checkpoints occurs.
+
+When retrieval is enabled, matching records are injected once into each
+constructed model request as provenance-bearing, JSON-encoded untrusted data,
+separate from checkpoint continuation and tool history. The context builder
+enforces the existing request byte limit and preserves whole tool-call/result
+groups. Retrieval/storage errors fail the run explicitly rather than silently
+omitting requested context.

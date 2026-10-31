@@ -57,6 +57,10 @@ class Settings(BaseModel):
     partial_result_policy: Literal["fail", "allow"] = "fail"
     required_artifacts: tuple[str, ...] = ()
     result_schema: dict[str, object] = Field(default_factory=dict)
+    memory_retrieval_enabled: bool = False
+    memory_extraction_enabled: bool = False
+    memory_retrieval_limit: int = Field(default=5, ge=1, le=20)
+    memory_context_bytes: int = Field(default=2048, ge=128, le=16384)
     model_concurrency: int = Field(default=2, ge=1, le=32)
     model_queue_capacity: int = Field(default=8, ge=0, le=1024)
     model_provider_concurrency: int = Field(default=1, ge=1, le=32)
@@ -119,7 +123,7 @@ class Settings(BaseModel):
                     "task_queue_capacity",
                     "result_schema",
                 }
-            )
+            ),
         )
 
 

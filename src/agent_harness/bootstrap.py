@@ -18,8 +18,10 @@ from agent_harness.artifacts.service import ArtifactService
 from agent_harness.config import Settings
 from agent_harness.domain.entities import JsonObject, Task
 from agent_harness.domain.errors import require
+from agent_harness.domain.memory import MemorySharing
 from agent_harness.domain.model import RunOptions
 from agent_harness.domain.tooling import Invocation
+from agent_harness.memory import MemoryService
 from agent_harness.models.gateway import ModelGateway
 from agent_harness.persistence.mongo import MongoStore
 from agent_harness.ports.model import ModelClient
@@ -44,6 +46,7 @@ class Application:
     task_scheduler: TaskScheduler
     agent_factory: AgentFactory
     coordinator: TaskCoordinator
+    memory: MemoryService
 
 
 def resource_scheduler(settings: Settings) -> ResourceScheduler:
@@ -89,6 +92,7 @@ async def application(
         if own_scheduler:
             await stack.enter_async_context(store.scheduler_ownership())
         try:
+            memory = MemoryService(store, clock, ids, scheduler=scheduler)
             yield Application(
                 store,
                 RunService(store, clock, ids),
@@ -99,6 +103,7 @@ async def application(
                 task_scheduler,
                 agent_factory,
                 TaskCoordinator(store, clock, ids, agent_factory, task_scheduler),
+                memory,
             )
         finally:
             await task_scheduler.shutdown()
@@ -158,6 +163,34 @@ async def runner(
                 execute_child,
             )
 
+        async def save_memory(invocation: Invocation) -> JsonObject:
+            args = json.loads(invocation.arguments.text)
+            async with app.store.transaction(invocation.user_id) as tx:
+                task = await tx.get_task(invocation.task_id)
+            require(task is not None, "Memory source task is unavailable")
+            assert task is not None
+            record = await app.memory.create(
+                invocation.user_id,
+                task.agent_definition_id,
+                args["content"],
+                tags=tuple(args.get("tags", ())),
+                sharing=MemorySharing(args["sharing"]),
+                source_run_id=invocation.run_id,
+                source_task_id=invocation.task_id,
+                record_id=invocation.invocation_id,
+            )
+            return JsonObject(
+                json.dumps(
+                    {
+                        "record_id": record.record_id,
+                        "sharing": record.sharing.value,
+                        "tags": list(record.tags),
+                        "source_run_id": record.source_run_id,
+                        "source_task_id": record.source_task_id,
+                    }
+                )
+            )
+
         tools = ToolExecutor(
             app.store,
             builtin_registry(
@@ -165,12 +198,14 @@ async def runner(
                 Path(options.workspace),
                 Path(options.artifact_root),
                 delegate,
+                memory_save=save_memory if options.memory_extraction_enabled else None,
             ),
             app.clock,
             app.scheduler,
             app.blocking_tools,
             app.store.assert_scheduler_ownership,
         )
+
         agent = AgentRunner(
             app.store,
             ModelGateway(client, app.scheduler, options.provider),
@@ -179,6 +214,7 @@ async def runner(
             tools,
             app.agent_factory,
             app.store.assert_scheduler_ownership,
+            app.memory,
         )
         agent_holder["agent"] = agent
         yield agent

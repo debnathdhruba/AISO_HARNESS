@@ -1,8 +1,8 @@
 # Agent Harness
 
-A standalone Python agent harness under phased development. Phases 2 through 7
-are implemented; Phases 5 through 7 await human review. Runs, model decisions,
-tool invocations, events and checkpoints persist in MongoDB.
+A standalone Python agent harness under phased development. Phases 2 through 8
+are implemented and await human review. Runs, model decisions, tool invocations,
+events, checkpoints and user memory persist in MongoDB.
 
 ## Run with Python
 
@@ -171,6 +171,50 @@ Control requests are persisted and take effect at safe boundaries:
 
 `inspect` and control/reconciliation commands do not acquire scheduler
 ownership; only a run worker or explicit `recover` command does.
+
+## User memory (Phase 8)
+
+Memory is stored in the MongoDB `memory_records` collection. Retrieval and
+extraction default off; enable either per run in TOML:
+
+```toml
+memory_retrieval_enabled = true
+memory_extraction_enabled = true
+memory_retrieval_limit = 5
+memory_context_bytes = 2048
+```
+
+For an Ollama-ready example with both options enabled, use
+`examples/memory.toml`:
+
+```powershell
+.\.venv\Scripts\python.exe -m agent_harness.interfaces.cli run --config examples/memory.toml --task "Remember that I prefer concise answers and share this preference with my agents." --user local-user
+.\.venv\Scripts\python.exe -m agent_harness.interfaces.cli run --config examples/memory.toml --task "How do I prefer answers?" --user local-user
+.\.venv\Scripts\python.exe -m agent_harness.interfaces.cli run --config examples/memory.toml --task "How does local-user prefer answers?" --user another-user
+```
+
+The last run should not retrieve `local-user`'s records. Review the saved
+record with `memory search`; extraction still depends on the model following the
+explicit save policy.
+
+With extraction enabled, ask the agent to remember a specific fact. It must
+select `private` (only the same user and agent definition) or `shared` (other
+agent definitions for the same user). Retrieval injects matching facts as
+untrusted context; it never reads checkpoints as memory. To manage records
+directly, use `memory save|get|search|update|delete` with `--user` and `--agent`.
+For example:
+
+```powershell
+.\.venv\Scripts\python.exe -m agent_harness.interfaces.cli memory save --user local-user --agent coordinator --sharing shared --content "Prefers concise answers" --tags preference,style
+.\.venv\Scripts\python.exe -m agent_harness.interfaces.cli memory search --user local-user --agent researcher --query "answer style"
+.\.venv\Scripts\python.exe -m agent_harness.interfaces.cli memory delete RECORD_ID --user local-user --agent coordinator
+```
+
+Cross-user reads and owner-only update/delete are enforced even when a caller
+knows a record ID. The local memory retriever is deterministic lexical ranking;
+semantic providers can implement the retrieval protocol without adding a
+required vector database. Memory content may be sensitive, so protect MongoDB
+credentials and review output before sharing it.
 
 ## Budgets and completion validation (Phase 6)
 

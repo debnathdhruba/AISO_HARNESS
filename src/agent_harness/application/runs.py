@@ -45,6 +45,16 @@ class RunService:
                     }
                 )
             ),
+            memory=JsonObject(
+                json.dumps(
+                    {
+                        "retrieval_enabled": options.memory_retrieval_enabled,
+                        "extraction_enabled": options.memory_extraction_enabled,
+                        "retrieval_limit": options.memory_retrieval_limit,
+                        "context_bytes": options.memory_context_bytes,
+                    }
+                )
+            ),
         )
         run = Run(
             self._ids.new_id(),
@@ -55,7 +65,11 @@ class RunService:
             now,
             deadline=now + timedelta(seconds=options.timeout_seconds),
         )
-        capabilities = tuple(sorted(set(options.tool_allowlist)))
+        capabilities = set(options.tool_allowlist)
+        if options.memory_extraction_enabled:
+            capabilities.add("memory_save")
+        else:
+            capabilities.discard("memory_save")
         task = Task(
             task_id,
             run.run_id,
@@ -75,7 +89,7 @@ class RunService:
             agent_instance_id=self._ids.new_id(),
             agent_definition_id="coordinator",
             agent_definition_version="1",
-            capabilities=capabilities,
+            capabilities=tuple(sorted(capabilities)),
         )
         async with self._store.transaction(user_id) as tx:
             await tx.create_run(run)

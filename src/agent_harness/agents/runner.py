@@ -21,6 +21,7 @@ from agent_harness.domain.model import (
     StepStatus,
 )
 from agent_harness.domain.states import RUN_TRANSITIONS, ControlIntent, RunStatus, TaskStatus
+from agent_harness.memory import MemoryService, render_memory_context
 from agent_harness.models.context import build_context, tool_schema_size
 from agent_harness.ports.model import ModelClient
 from agent_harness.ports.state import Clock, IdGenerator, StateStore, StateTransaction
@@ -64,11 +65,13 @@ class AgentRunner:
         tools: ToolExecutor | None = None,
         agent_factory: AgentFactory | None = None,
         ownership_check: Callable[[], Awaitable[None]] | None = None,
+        memory: MemoryService | None = None,
     ) -> None:
         self._store, self._model, self._clock, self._ids = store, model, clock, ids
         self._tools = tools
         self._agent_factory = agent_factory or AgentFactory(local_agent_registry())
         self._ownership_check = ownership_check
+        self._memory = memory
         self._run_locks: dict[tuple[str, str], tuple[asyncio.Lock, int]] = {}
         self._run_locks_guard = asyncio.Lock()
 
@@ -333,6 +336,34 @@ class AgentRunner:
                 max_steps=instance.max_steps,
                 tool_allowlist=instance.capabilities,
             )
+        memory_context = ""
+        if options.memory_retrieval_enabled:
+            if self._memory is None:
+                return await self._finish(
+                    user_id,
+                    run_id,
+                    task_id,
+                    error=HarnessError(
+                        ErrorCode.STORAGE,
+                        "Memory retrieval is enabled but no memory service is configured",
+                    ),
+                )
+            try:
+                memories = await self._memory.retrieve(
+                    user_id,
+                    instance.definition.definition_id,
+                    task.objective,
+                    limit=options.memory_retrieval_limit,
+                    max_bytes=min(options.memory_context_bytes, options.max_input_bytes // 4),
+                )
+                memory_context = render_memory_context(memories)
+            except HarnessError as memory_error:
+                return await self._finish(
+                    user_id,
+                    run_id,
+                    task_id,
+                    error=memory_error,
+                )
         continuation = (
             json.loads(previous_checkpoint.continuation.text)
             if previous_checkpoint is not None
@@ -714,6 +745,13 @@ class AgentRunner:
                         + (
                             TOOL_PROMPT
                             + (
+                                " Memory is opt-in. Save a concise fact only when the user "
+                                "explicitly asks you to remember it; use shared only when they "
+                                "explicitly request sharing with their agents."
+                                if options.memory_extraction_enabled
+                                else ""
+                            )
+                            + (
                                 " Next required tool: " + outstanding_tools[0] + ". Call it now."
                                 if outstanding_tools
                                 else ""
@@ -725,6 +763,7 @@ class AgentRunner:
                     if stage == Stage.DECISION
                     else instance.definition.instructions + "\n\n" + RESPONSE_PROMPT,
                     task.objective
+                    + memory_context
                     + (
                         "\n\nCompletion checks rejected the previous candidate. "
                         "Correct only these issues: " + completion_feedback

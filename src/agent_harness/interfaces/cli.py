@@ -11,12 +11,15 @@ from agent_harness.bootstrap import application, runner
 from agent_harness.config import Settings, load_settings
 from agent_harness.domain.entities import Event, JsonObject, Run
 from agent_harness.domain.errors import HarnessError
+from agent_harness.domain.memory import MemoryRecord, MemorySharing
 from agent_harness.domain.model import RunOptions
 from agent_harness.domain.states import ControlIntent, RunStatus
 from agent_harness.models.codec import encode_step
 from agent_harness.tools.executor import decide_approval
 
 app = typer.Typer(no_args_is_help=True, help="Standalone agent harness: offline or local Ollama.")
+memory_app = typer.Typer(no_args_is_help=True, help="Manage user-scoped agent memory.")
+app.add_typer(memory_app, name="memory")
 
 
 def summary(run: Run) -> dict[str, object]:
@@ -30,6 +33,25 @@ def summary(run: Run) -> dict[str, object]:
         "result": json.loads(run.result.text) if run.result else None,
         "error": json.loads(run.error.text) if run.error else None,
     }
+
+
+def memory_summary(record: MemoryRecord) -> dict[str, object]:
+    return {
+        "record_id": record.record_id,
+        "user_id": record.user_id,
+        "owner_agent_definition_id": record.owner_agent_definition_id,
+        "sharing": record.sharing.value,
+        "content": record.content,
+        "tags": list(record.tags),
+        "source_run_id": record.source_run_id,
+        "source_task_id": record.source_task_id,
+        "created_at": record.created_at.isoformat(),
+        "updated_at": record.updated_at.isoformat(),
+    }
+
+
+def parse_tags(value: str) -> tuple[str, ...]:
+    return tuple(tag.strip() for tag in value.split(",") if tag.strip())
 
 
 async def execute(settings: Settings, user: str, task: str | None, run_id: str | None) -> Run:
@@ -452,6 +474,99 @@ def deny_command(
 ) -> None:
     """Deny an invocation; continuation feeds the denial back to the agent."""
     approval_command(invocation_id, user, argument_hash, database_name, False)
+
+
+@memory_app.command("save")
+def memory_save_command(
+    content: Annotated[str, typer.Option(help="Fact explicitly selected for memory")],
+    user: Annotated[str, typer.Option(help="Trusted-local principal")],
+    agent: Annotated[str, typer.Option(help="Owning agent definition, e.g. coordinator")],
+    sharing: Annotated[
+        MemorySharing,
+        typer.Option(help="private for this agent; shared for this user's agents"),
+    ] = MemorySharing.PRIVATE,
+    tags: Annotated[str, typer.Option(help="Comma-separated retrieval tags")] = "",
+    database_name: Annotated[str | None, typer.Option(help="MongoDB database name")] = None,
+) -> None:
+    async def save() -> MemoryRecord:
+        async with application(load_settings(database_name=database_name)) as services:
+            return await services.memory.create(
+                user,
+                agent,
+                content,
+                tags=parse_tags(tags),
+                sharing=sharing,
+            )
+
+    typer.echo(json.dumps(memory_summary(asyncio.run(save())), indent=2))
+
+
+@memory_app.command("get")
+def memory_get_command(
+    record_id: str,
+    user: Annotated[str, typer.Option(help="Trusted-local principal")],
+    agent: Annotated[str, typer.Option(help="Agent definition requesting access")],
+    database_name: Annotated[str | None, typer.Option(help="MongoDB database name")] = None,
+) -> None:
+    async def read() -> MemoryRecord:
+        async with application(load_settings(database_name=database_name)) as services:
+            return await services.memory.get(user, agent, record_id)
+
+    typer.echo(json.dumps(memory_summary(asyncio.run(read())), indent=2))
+
+
+@memory_app.command("search")
+def memory_search_command(
+    query: Annotated[str, typer.Option(help="Lexical query text")],
+    user: Annotated[str, typer.Option(help="Trusted-local principal")],
+    agent: Annotated[str, typer.Option(help="Agent definition requesting access")],
+    limit: Annotated[int, typer.Option(min=1, max=20)] = 5,
+    database_name: Annotated[str | None, typer.Option(help="MongoDB database name")] = None,
+) -> None:
+    async def search() -> tuple[MemoryRecord, ...]:
+        async with application(load_settings(database_name=database_name)) as services:
+            return await services.memory.retrieve(user, agent, query, limit=limit)
+
+    typer.echo(json.dumps([memory_summary(record) for record in asyncio.run(search())], indent=2))
+
+
+@memory_app.command("update")
+def memory_update_command(
+    record_id: str,
+    content: Annotated[str, typer.Option(help="Replacement memory content")],
+    user: Annotated[str, typer.Option(help="Trusted-local principal")],
+    agent: Annotated[str, typer.Option(help="Owning agent definition")],
+    sharing: Annotated[MemorySharing, typer.Option()] = MemorySharing.PRIVATE,
+    tags: Annotated[str, typer.Option(help="Replacement comma-separated tags")] = "",
+    database_name: Annotated[str | None, typer.Option(help="MongoDB database name")] = None,
+) -> None:
+    async def update() -> MemoryRecord:
+        async with application(load_settings(database_name=database_name)) as services:
+            return await services.memory.update(
+                user,
+                agent,
+                record_id,
+                content=content,
+                sharing=sharing,
+                tags=parse_tags(tags),
+            )
+
+    typer.echo(json.dumps(memory_summary(asyncio.run(update())), indent=2))
+
+
+@memory_app.command("delete")
+def memory_delete_command(
+    record_id: str,
+    user: Annotated[str, typer.Option(help="Trusted-local principal")],
+    agent: Annotated[str, typer.Option(help="Owning agent definition")],
+    database_name: Annotated[str | None, typer.Option(help="MongoDB database name")] = None,
+) -> None:
+    async def delete() -> None:
+        async with application(load_settings(database_name=database_name)) as services:
+            await services.memory.delete(user, agent, record_id)
+
+    asyncio.run(delete())
+    typer.echo(json.dumps({"record_id": record_id, "deleted": True}))
 
 
 def main() -> None:

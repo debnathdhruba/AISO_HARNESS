@@ -2,13 +2,13 @@ import ast
 import json
 import math
 import operator
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from pathlib import Path
-from collections.abc import Awaitable
 
 from agent_harness.artifacts.service import ArtifactService
 from agent_harness.domain.entities import JsonObject
 from agent_harness.domain.errors import require
+from agent_harness.domain.memory import MemorySharing
 from agent_harness.domain.tooling import Effect, Invocation, ToolSpec
 from agent_harness.tools.registry import RegisteredTool, ToolRegistry
 from agent_harness.tools.workspace import WorkspaceFileService
@@ -70,6 +70,7 @@ def builtin_registry(
     workspace: Path,
     artifact_root: Path,
     delegate: Callable[[Invocation], Awaitable[JsonObject]] | None = None,
+    memory_save: Callable[[Invocation], Awaitable[JsonObject]] | None = None,
 ) -> ToolRegistry:
     text = {"type": "string", "maxLength": 4096}
     output = JsonObject('{"type":"object"}')
@@ -107,112 +108,117 @@ def builtin_registry(
         args = json.loads(invocation.arguments.text)
         return await files.edit(invocation, args["path"], args["old_text"], args["new_text"])
 
+    async def save_memory(invocation: Invocation) -> JsonObject:
+        callback = memory_save
+        if callback is None:
+            require(False, "Memory extraction is not enabled")
+            raise AssertionError("unreachable")
+        return await callback(invocation)
+
     tools = [
-            RegisteredTool(
-                ToolSpec(
-                    "calculator",
-                    "1",
-                    "Compute basic arithmetic (+ - * / %).",
-                    schema({"expression": {"type": "string", "maxLength": 200}}, ["expression"]),
-                    output,
-                ),
-                calculator,
+        RegisteredTool(
+            ToolSpec(
+                "calculator",
+                "1",
+                "Compute basic arithmetic (+ - * / %).",
+                schema({"expression": {"type": "string", "maxLength": 200}}, ["expression"]),
+                output,
             ),
-            RegisteredTool(
-                ToolSpec(
-                    "artifact_write",
-                    "1",
-                    "Write a bounded text artifact in this task.",
-                    schema(
-                        {"name": {"type": "string", "maxLength": 100}, "content": text},
-                        ["name", "content"],
-                    ),
-                    output,
-                    effect=Effect.IDEMPOTENT_WRITE,
-                    idempotency="invocation_id",
-                    supports_reconciliation=True,
+            calculator,
+        ),
+        RegisteredTool(
+            ToolSpec(
+                "artifact_write",
+                "1",
+                "Write a bounded text artifact in this task.",
+                schema(
+                    {"name": {"type": "string", "maxLength": 100}, "content": text},
+                    ["name", "content"],
                 ),
-                write,
+                output,
+                effect=Effect.IDEMPOTENT_WRITE,
+                idempotency="invocation_id",
+                supports_reconciliation=True,
             ),
-            RegisteredTool(
-                ToolSpec(
-                    "artifact_read",
-                    "1",
-                    "Read an artifact by its returned ID.",
-                    schema({"artifact_id": {"type": "string"}}, ["artifact_id"]),
-                    output,
+            write,
+        ),
+        RegisteredTool(
+            ToolSpec(
+                "artifact_read",
+                "1",
+                "Read an artifact by its returned ID.",
+                schema({"artifact_id": {"type": "string"}}, ["artifact_id"]),
+                output,
+            ),
+            read,
+        ),
+        RegisteredTool(
+            ToolSpec("artifact_list", "1", "List artifacts in this task.", schema({}, []), output),
+            listing,
+        ),
+        RegisteredTool(
+            ToolSpec(
+                "read_file",
+                "1",
+                "Read a bounded UTF-8 text file inside the configured workspace.",
+                schema({"path": {"type": "string", "maxLength": 512}}, ["path"]),
+                output,
+                max_output_bytes=65_536,
+            ),
+            read_file,
+        ),
+        RegisteredTool(
+            ToolSpec(
+                "write_file",
+                "1",
+                "Write bounded UTF-8 text to a file inside the configured workspace.",
+                schema(
+                    {
+                        "path": {"type": "string", "maxLength": 512},
+                        "content": text,
+                    },
+                    ["path", "content"],
                 ),
-                read,
+                output,
+                effect=Effect.NON_IDEMPOTENT_WRITE,
             ),
-            RegisteredTool(
-                ToolSpec(
-                    "artifact_list", "1", "List artifacts in this task.", schema({}, []), output
+            write_file,
+        ),
+        RegisteredTool(
+            ToolSpec(
+                "search_files",
+                "1",
+                "Search UTF-8 files with a literal query and glob pattern.",
+                schema(
+                    {
+                        "query": {"type": "string", "minLength": 1, "maxLength": 512},
+                        "pattern": {"type": "string", "maxLength": 200},
+                    },
+                    ["query", "pattern"],
                 ),
-                listing,
+                output,
+                max_output_bytes=32_768,
             ),
-            RegisteredTool(
-                ToolSpec(
-                    "read_file",
-                    "1",
-                    "Read a bounded UTF-8 text file inside the configured workspace.",
-                    schema({"path": {"type": "string", "maxLength": 512}}, ["path"]),
-                    output,
-                    max_output_bytes=65_536,
+            search_files,
+        ),
+        RegisteredTool(
+            ToolSpec(
+                "edit_file",
+                "1",
+                "Replace one exact, unique text match in a workspace file.",
+                schema(
+                    {
+                        "path": {"type": "string", "maxLength": 512},
+                        "old_text": {"type": "string", "minLength": 1, "maxLength": 4096},
+                        "new_text": {"type": "string", "maxLength": 4096},
+                    },
+                    ["path", "old_text", "new_text"],
                 ),
-                read_file,
+                output,
+                effect=Effect.NON_IDEMPOTENT_WRITE,
             ),
-            RegisteredTool(
-                ToolSpec(
-                    "write_file",
-                    "1",
-                    "Write bounded UTF-8 text to a file inside the configured workspace.",
-                    schema(
-                        {
-                            "path": {"type": "string", "maxLength": 512},
-                            "content": text,
-                        },
-                        ["path", "content"],
-                    ),
-                    output,
-                    effect=Effect.NON_IDEMPOTENT_WRITE,
-                ),
-                write_file,
-            ),
-            RegisteredTool(
-                ToolSpec(
-                    "search_files",
-                    "1",
-                    "Search UTF-8 files with a literal query and glob pattern.",
-                    schema(
-                        {
-                            "query": {"type": "string", "minLength": 1, "maxLength": 512},
-                            "pattern": {"type": "string", "maxLength": 200},
-                        },
-                        ["query", "pattern"],
-                    ),
-                    output,
-                    max_output_bytes=32_768,
-                ),
-                search_files,
-            ),
-            RegisteredTool(
-                ToolSpec(
-                    "edit_file",
-                    "1",
-                    "Replace one exact, unique text match in a workspace file.",
-                    schema(
-                        {
-                            "path": {"type": "string", "maxLength": 512},
-                            "old_text": {"type": "string", "minLength": 1, "maxLength": 4096},
-                            "new_text": {"type": "string", "maxLength": 4096},
-                        },
-                        ["path", "old_text", "new_text"],
-                    ),
-                    output,
-                    effect=Effect.NON_IDEMPOTENT_WRITE,
-                ),
-                edit_file,
-            ),
+            edit_file,
+        ),
     ]
     if delegate is not None:
         tools.append(
@@ -231,7 +237,11 @@ def builtin_registry(
                                 "items": {
                                     "type": "object",
                                     "properties": {
-                                        "alias": {"type": "string", "minLength": 1, "maxLength": 64},
+                                        "alias": {
+                                            "type": "string",
+                                            "minLength": 1,
+                                            "maxLength": 64,
+                                        },
                                         "idempotency_key": {
                                             "type": "string",
                                             "minLength": 1,
@@ -263,7 +273,11 @@ def builtin_registry(
                                             "items": {"type": "string", "maxLength": 64},
                                             "maxItems": 16,
                                         },
-                                        "max_steps": {"type": "integer", "minimum": 1, "maximum": 100},
+                                        "max_steps": {
+                                            "type": "integer",
+                                            "minimum": 1,
+                                            "maximum": 100,
+                                        },
                                     },
                                     "required": [
                                         "alias",
@@ -283,6 +297,38 @@ def builtin_registry(
                     supports_reconciliation=True,
                 ),
                 delegate,
+            )
+        )
+    if memory_save is not None:
+        tools.append(
+            RegisteredTool(
+                ToolSpec(
+                    "memory_save",
+                    "1",
+                    "Save a concise fact only when the user explicitly asks you to remember it. "
+                    "Use shared only when the user explicitly asks to share it with their agents.",
+                    schema(
+                        {
+                            "content": {"type": "string", "minLength": 1, "maxLength": 4096},
+                            "sharing": {
+                                "type": "string",
+                                "enum": [MemorySharing.PRIVATE.value, MemorySharing.SHARED.value],
+                            },
+                            "tags": {
+                                "type": "array",
+                                "items": {"type": "string", "minLength": 1, "maxLength": 80},
+                                "maxItems": 20,
+                                "uniqueItems": True,
+                            },
+                        },
+                        ["content", "sharing"],
+                    ),
+                    output,
+                    effect=Effect.IDEMPOTENT_WRITE,
+                    idempotency="invocation_id",
+                    supports_reconciliation=True,
+                ),
+                save_memory,
             )
         )
     return ToolRegistry(tuple(tools))

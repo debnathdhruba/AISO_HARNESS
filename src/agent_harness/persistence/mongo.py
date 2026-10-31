@@ -18,6 +18,7 @@ from pymongo.errors import DuplicateKeyError, PyMongoError
 from agent_harness.domain.budgets import BudgetLimits, BudgetSnapshot, BudgetUsage
 from agent_harness.domain.entities import Checkpoint, Event, JsonObject, Run, Task
 from agent_harness.domain.errors import ErrorCode, HarnessError, require
+from agent_harness.domain.memory import MemoryRecord, MemorySharing
 from agent_harness.domain.model import ModelResponse, Step, StepStatus
 from agent_harness.domain.states import (
     RUN_TRANSITIONS,
@@ -159,6 +160,47 @@ class MongoStore:
         self._scheduler_lease_lost = asyncio.Event()
         self._scheduler_heartbeat: asyncio.Task[None] | None = None
 
+    @staticmethod
+    def _memory_document(record: MemoryRecord) -> Document:
+        return {
+            "_id": record.record_id,
+            "record_id": record.record_id,
+            "user_id": record.user_id,
+            "owner_agent_definition_id": record.owner_agent_definition_id,
+            "content": record.content,
+            "tags": list(record.tags),
+            "sharing": record.sharing.value,
+            "source_run_id": record.source_run_id,
+            "source_task_id": record.source_task_id,
+            "created_at": record.created_at.isoformat(),
+            "updated_at": record.updated_at.isoformat(),
+            "deleted_at": record.deleted_at.isoformat() if record.deleted_at else None,
+        }
+
+    @staticmethod
+    def _decode_memory(document: Document) -> MemoryRecord:
+        return MemoryRecord(
+            record_id=str(document["record_id"]),
+            user_id=str(document["user_id"]),
+            owner_agent_definition_id=str(document["owner_agent_definition_id"]),
+            content=str(document["content"]),
+            tags=tuple(str(tag) for tag in document["tags"]),
+            sharing=MemorySharing(str(document["sharing"])),
+            created_at=datetime.fromisoformat(str(document["created_at"])),
+            updated_at=datetime.fromisoformat(str(document["updated_at"])),
+            source_run_id=(
+                str(document["source_run_id"]) if document.get("source_run_id") else None
+            ),
+            source_task_id=(
+                str(document["source_task_id"]) if document.get("source_task_id") else None
+            ),
+            deleted_at=(
+                datetime.fromisoformat(str(document["deleted_at"]))
+                if document.get("deleted_at")
+                else None
+            ),
+        )
+
     async def __aenter__(self) -> "MongoStore":
         async with self._lifecycle_lock:
             require(not self._opened, "Mongo store is already open")
@@ -185,6 +227,147 @@ class MongoStore:
                 if self._opened:
                     self._opened = False
                     await self._client.close()
+
+    async def save_memory(self, record: MemoryRecord) -> None:
+        require(self._opened, "Mongo store is not open")
+        try:
+            await self._validate_memory_provenance(record)
+            document = self._memory_document(record)
+            identity = {
+                key: value
+                for key, value in document.items()
+                if key not in {"_id", "created_at", "updated_at"}
+            }
+            await self._database["memory_records"].update_one(
+                {"_id": record.record_id, **identity},
+                {"$setOnInsert": document},
+                upsert=True,
+            )
+        except DuplicateKeyError:
+            raise HarnessError(
+                ErrorCode.CONCURRENCY_CONFLICT,
+                "Memory id was already used for different content",
+            ) from None
+        except PyMongoError:
+            raise HarnessError(ErrorCode.STORAGE, "Cannot save memory record") from None
+
+    async def _validate_memory_provenance(self, record: MemoryRecord) -> None:
+        if record.source_run_id is not None:
+            run = await self._database["runs"].find_one(
+                {"run_id": record.source_run_id, "user_id": record.user_id},
+                projection={"_id": 1},
+            )
+            require(run is not None, "Memory run provenance is unavailable")
+        if record.source_task_id is not None:
+            row = await self._database["tasks"].find_one(
+                {
+                    "task_id": record.source_task_id,
+                    "run_id": record.source_run_id,
+                    "user_id": record.user_id,
+                }
+            )
+            require(row is not None, "Memory task provenance is unavailable")
+            assert row is not None
+            task = decode_task(_snapshot_text(row["snapshot"], TASK_JSON_PATHS))
+            require(
+                task.agent_definition_id == record.owner_agent_definition_id,
+                "Memory owner does not match task provenance",
+            )
+
+    async def get_memory(
+        self, record_id: str, user_id: str, agent_definition_id: str
+    ) -> MemoryRecord | None:
+        require(self._opened, "Mongo store is not open")
+        try:
+            document = await self._database["memory_records"].find_one(
+                {
+                    "_id": record_id,
+                    "user_id": user_id,
+                    "deleted_at": None,
+                    "$or": [
+                        {"sharing": MemorySharing.SHARED.value},
+                        {
+                            "sharing": MemorySharing.PRIVATE.value,
+                            "owner_agent_definition_id": agent_definition_id,
+                        },
+                    ],
+                }
+            )
+        except PyMongoError:
+            raise HarnessError(ErrorCode.STORAGE, "Cannot read memory record") from None
+        return self._decode_memory(document) if document is not None else None
+
+    async def update_memory(self, record: MemoryRecord, expected_updated_at: str) -> None:
+        require(self._opened, "Mongo store is not open")
+        document = self._memory_document(record)
+        document.pop("_id")
+        try:
+            result = await self._database["memory_records"].update_one(
+                {
+                    "_id": record.record_id,
+                    "user_id": record.user_id,
+                    "owner_agent_definition_id": record.owner_agent_definition_id,
+                    "deleted_at": None,
+                    "updated_at": expected_updated_at,
+                },
+                {"$set": document},
+            )
+        except PyMongoError:
+            raise HarnessError(ErrorCode.STORAGE, "Cannot update memory record") from None
+        if result.matched_count != 1:
+            raise HarnessError(
+                ErrorCode.CONCURRENCY_CONFLICT,
+                "Memory record changed or is unavailable",
+                retryable=True,
+            )
+
+    async def delete_memory(
+        self, record_id: str, user_id: str, agent_definition_id: str, deleted_at: str
+    ) -> None:
+        require(self._opened, "Mongo store is not open")
+        try:
+            result = await self._database["memory_records"].update_one(
+                {
+                    "_id": record_id,
+                    "user_id": user_id,
+                    "owner_agent_definition_id": agent_definition_id,
+                    "deleted_at": None,
+                },
+                {"$set": {"deleted_at": deleted_at, "updated_at": deleted_at}},
+            )
+        except PyMongoError:
+            raise HarnessError(ErrorCode.STORAGE, "Cannot delete memory record") from None
+        if result.matched_count != 1:
+            raise HarnessError(ErrorCode.AUTHORIZATION, "Memory record is unavailable")
+
+    async def memory_candidates(
+        self, user_id: str, agent_definition_id: str, limit: int
+    ) -> tuple[MemoryRecord, ...]:
+        require(self._opened, "Mongo store is not open")
+        require(1 <= limit <= 500, "Invalid memory candidate limit")
+        try:
+            cursor = (
+                self._database["memory_records"]
+                .find(
+                    {
+                        "user_id": user_id,
+                        "deleted_at": None,
+                        "$or": [
+                            {"sharing": MemorySharing.SHARED.value},
+                            {
+                                "sharing": MemorySharing.PRIVATE.value,
+                                "owner_agent_definition_id": agent_definition_id,
+                            },
+                        ],
+                    }
+                )
+                .sort([("updated_at", DESCENDING), ("_id", ASCENDING)])
+                .limit(limit)
+            )
+            documents = [document async for document in cursor]
+        except PyMongoError:
+            raise HarnessError(ErrorCode.STORAGE, "Cannot retrieve memory candidates") from None
+        return tuple(self._decode_memory(document) for document in documents)
 
     @asynccontextmanager
     async def scheduler_ownership(self) -> AsyncGenerator[None, None]:
@@ -354,6 +537,13 @@ class MongoStore:
             "budget_accounts": (
                 ("run_id", ASCENDING),
                 ("user_id", ASCENDING),
+            ),
+            "memory_records": (
+                ("user_id", ASCENDING),
+                ("deleted_at", ASCENDING),
+                ("sharing", ASCENDING),
+                ("owner_agent_definition_id", ASCENDING),
+                ("updated_at", DESCENDING),
             ),
         }
         for collection_name, keys in definitions.items():

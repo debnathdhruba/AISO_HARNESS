@@ -20,7 +20,9 @@ class AgentDefinition:
     max_depth: int = 0
 
     def __post_init__(self) -> None:
-        require(bool(self.definition_id.strip() and self.version.strip()), "Agent identity required")
+        require(
+            bool(self.definition_id.strip() and self.version.strip()), "Agent identity required"
+        )
         require(bool(self.instructions.strip()), "Agent instructions are required")
         require(len(set(self.capabilities)) == len(self.capabilities), "Duplicate capability")
         require(
@@ -47,14 +49,14 @@ class AgentRegistry:
     def __init__(self, definitions: tuple[AgentDefinition, ...]) -> None:
         keys = {(item.definition_id, item.version) for item in definitions}
         require(len(keys) == len(definitions), "Duplicate agent definition version")
-        self._definitions = {
-            (item.definition_id, item.version): item for item in definitions
-        }
+        self._definitions = {(item.definition_id, item.version): item for item in definitions}
 
     def get(self, definition_id: str, version: str) -> AgentDefinition:
         definition = self._definitions.get((definition_id, version))
         if definition is None:
-            raise HarnessError(ErrorCode.AUTHORIZATION, "Agent definition/version is not registered")
+            raise HarnessError(
+                ErrorCode.AUTHORIZATION, "Agent definition/version is not registered"
+            )
         return definition
 
 
@@ -63,9 +65,7 @@ class AgentFactory:
         self.registry = registry
 
     def create(self, task: Task, options: RunOptions) -> AgentInstance:
-        definition = self.registry.get(
-            task.agent_definition_id, task.agent_definition_version
-        )
+        definition = self.registry.get(task.agent_definition_id, task.agent_definition_version)
         capabilities = task.capabilities or (
             options.tool_allowlist if task.agent_definition_id == "single-agent" else ()
         )
@@ -104,6 +104,7 @@ def local_agent_registry() -> AgentRegistry:
                     *file_tools,
                     "write_file",
                     "edit_file",
+                    "memory_save",
                 ),
                 "Complete the assigned task using only authorized local capabilities.",
             ),
@@ -116,6 +117,7 @@ def local_agent_registry() -> AgentRegistry:
                     *file_tools,
                     "write_file",
                     "edit_file",
+                    "memory_save",
                     "delegate_tasks",
                 ),
                 "Coordinate bounded child agents when useful. Delegate only explicit objectives, "
@@ -128,14 +130,14 @@ def local_agent_registry() -> AgentRegistry:
             AgentDefinition(
                 "researcher",
                 "1",
-                ("calculator", *artifacts, *file_tools),
+                ("calculator", *artifacts, *file_tools, "memory_save"),
                 "Research only the supplied workspace and task handoff. Return concise findings "
                 "and cite file paths or artifact IDs when available.",
             ),
             AgentDefinition(
                 "writer",
                 "1",
-                ("calculator", *artifacts),
+                ("calculator", *artifacts, "memory_save"),
                 "Produce the requested artifact from the explicit task handoff. Do not invent "
                 "unprovided research.",
             ),

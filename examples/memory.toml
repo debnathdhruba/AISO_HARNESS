@@ -1,0 +1,9 @@
+provider = "ollama"
+database_name = "test"
+ollama_url = "http://127.0.0.1:11434"
+decision_model = "lfm2.5-thinking:1.2b"
+response_model = "gemma3:1b"
+memory_retrieval_enabled = true
+memory_extraction_enabled = true
+memory_retrieval_limit = 5
+memory_context_bytes = 2048
