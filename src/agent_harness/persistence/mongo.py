@@ -2,16 +2,18 @@
 
 import asyncio
 import json
+import os
 from collections.abc import AsyncGenerator, Awaitable, Callable, Coroutine
 from contextlib import asynccontextmanager
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from functools import wraps
 from typing import Any, Concatenate, ParamSpec, TypeVar
+from uuid import uuid4
 
-from pymongo import ASCENDING, DESCENDING, AsyncMongoClient
+from pymongo import ASCENDING, DESCENDING, AsyncMongoClient, ReturnDocument
 from pymongo.asynchronous.client_session import AsyncClientSession
-from pymongo.errors import PyMongoError
+from pymongo.errors import DuplicateKeyError, PyMongoError
 
 from agent_harness.domain.budgets import BudgetLimits, BudgetSnapshot, BudgetUsage
 from agent_harness.domain.entities import Checkpoint, Event, JsonObject, Run, Task
@@ -25,7 +27,7 @@ from agent_harness.domain.states import (
     TaskStatus,
     validate_transition,
 )
-from agent_harness.domain.tooling import Approval, ArtifactRecord, Invocation
+from agent_harness.domain.tooling import Approval, ArtifactRecord, Effect, Invocation
 from agent_harness.models.codec import decode_step, encode_step
 from agent_harness.persistence.codec import decode_run, decode_task, encode
 from agent_harness.persistence.tool_codec import (
@@ -63,6 +65,8 @@ STEP_JSON_PATHS = (
     ("data", "error"),
 )
 INVOCATION_JSON_PATHS = (("arguments",), ("result",), ("error",))
+OWNERSHIP_LEASE_ID = "agent-harness-scheduler"
+OWNERSHIP_LEASE_SECONDS = 30
 
 
 def _update_path(value: Any, path: tuple[str, ...], transform: Callable[[Any], Any]) -> Any:
@@ -151,6 +155,9 @@ class MongoStore:
         self._lifecycle_lock = asyncio.Lock()
         self._transaction_lock = asyncio.Lock()
         self._transaction_owner: asyncio.Task[object] | None = None
+        self._scheduler_owner_id: str | None = None
+        self._scheduler_lease_lost = asyncio.Event()
+        self._scheduler_heartbeat: asyncio.Task[None] | None = None
 
     async def __aenter__(self) -> "MongoStore":
         async with self._lifecycle_lock:
@@ -178,6 +185,130 @@ class MongoStore:
                 if self._opened:
                     self._opened = False
                     await self._client.close()
+
+    @asynccontextmanager
+    async def scheduler_ownership(self) -> AsyncGenerator[None, None]:
+        require(self._opened, "Mongo store is not open")
+        require(self._scheduler_owner_id is None, "Scheduler ownership is already held")
+        owner_id = str(uuid4())
+        now = self._clock.utc_now()
+        try:
+            lease = await self._database["process_ownership"].find_one_and_update(
+                {
+                    "_id": OWNERSHIP_LEASE_ID,
+                    "$or": [
+                        {"expires_at": {"$lte": now}},
+                        {"owner_id": owner_id},
+                    ],
+                },
+                {
+                    "$set": {
+                        "owner_id": owner_id,
+                        "process_id": os.getpid(),
+                        "heartbeat_at": now,
+                        "expires_at": now + timedelta(seconds=OWNERSHIP_LEASE_SECONDS),
+                    }
+                },
+                upsert=True,
+                return_document=ReturnDocument.AFTER,
+            )
+        except DuplicateKeyError:
+            raise HarnessError(
+                ErrorCode.CONCURRENCY_CONFLICT,
+                "Another process owns the agent scheduler",
+                retryable=True,
+            ) from None
+        except PyMongoError:
+            raise HarnessError(ErrorCode.STORAGE, "Cannot acquire scheduler ownership") from None
+        require(
+            lease is not None and lease.get("owner_id") == owner_id,
+            "Another process owns the agent scheduler",
+        )
+        self._scheduler_owner_id = owner_id
+        self._scheduler_lease_lost.clear()
+        self._scheduler_heartbeat = asyncio.create_task(self._renew_scheduler_lease(owner_id))
+        try:
+            await self.recover_startup()
+            yield
+        finally:
+            heartbeat = self._scheduler_heartbeat
+            self._scheduler_heartbeat = None
+            if heartbeat is not None:
+                heartbeat.cancel()
+                await asyncio.gather(heartbeat, return_exceptions=True)
+            self._scheduler_owner_id = None
+            await self._database["process_ownership"].delete_one(
+                {"_id": OWNERSHIP_LEASE_ID, "owner_id": owner_id}
+            )
+
+    async def _renew_scheduler_lease(self, owner_id: str) -> None:
+        while True:
+            await asyncio.sleep(OWNERSHIP_LEASE_SECONDS / 3)
+            now = self._clock.utc_now()
+            try:
+                async with self._transaction_lock:
+                    result = await self._database["process_ownership"].update_one(
+                        {
+                            "_id": OWNERSHIP_LEASE_ID,
+                            "owner_id": owner_id,
+                            "expires_at": {"$gt": now},
+                        },
+                        {
+                            "$set": {
+                                "heartbeat_at": now,
+                                "expires_at": now + timedelta(seconds=OWNERSHIP_LEASE_SECONDS),
+                            }
+                        },
+                    )
+            except PyMongoError:
+                self._scheduler_lease_lost.set()
+                return
+            if result.matched_count != 1:
+                self._scheduler_lease_lost.set()
+                return
+
+    async def assert_scheduler_ownership(self) -> None:
+        owner_id = self._scheduler_owner_id
+        require(owner_id is not None, "This process does not own the agent scheduler")
+        require(not self._scheduler_lease_lost.is_set(), "Scheduler ownership lease was lost")
+        now = self._clock.utc_now()
+        try:
+            lease = await self._database["process_ownership"].find_one(
+                {
+                    "_id": OWNERSHIP_LEASE_ID,
+                    "owner_id": owner_id,
+                    "expires_at": {"$gt": now},
+                },
+                projection={"_id": 1},
+            )
+        except PyMongoError:
+            raise HarnessError(ErrorCode.STORAGE, "Cannot verify scheduler ownership") from None
+        require(lease is not None, "Scheduler ownership lease was lost")
+
+    async def recover_startup(self) -> None:
+        require(
+            self._scheduler_owner_id is not None, "Scheduler ownership is required for recovery"
+        )
+        cursor = self._database["runs"].find(
+            {
+                "status": {
+                    "$in": [
+                        RunStatus.QUEUED.value,
+                        RunStatus.RUNNING.value,
+                        RunStatus.WAITING.value,
+                        RunStatus.PAUSED.value,
+                    ]
+                }
+            },
+            projection={"run_id": 1, "user_id": 1},
+        )
+        records = [record async for record in cursor]
+        for record in records:
+            await self.assert_scheduler_ownership()
+            async with self.transaction(str(record["user_id"])) as tx:
+                assert isinstance(tx, MongoTransaction)
+                await tx.recover_run(str(record["run_id"]))
+        await self.assert_scheduler_ownership()
 
     async def _ensure_indexes(self) -> None:
         definitions: dict[str, tuple[tuple[str, int], ...]] = {
@@ -252,9 +383,7 @@ class MongoStore:
             await self._database[collection_name].create_index(field, unique=True)
         await self._database["delegations"].create_index("child_task_id", unique=True)
         await self._database["budget_accounts"].create_index("task_id", unique=True)
-        await self._database["budget_reservations"].create_index(
-            "reservation_id", unique=True
-        )
+        await self._database["budget_reservations"].create_index("reservation_id", unique=True)
 
     @asynccontextmanager
     async def transaction(self, user_id: str) -> AsyncGenerator[StateTransaction, None]:
@@ -273,8 +402,15 @@ class MongoStore:
                 async with self._client.start_session() as session:
                     async with await session.start_transaction():
                         tx = MongoTransaction(
-                            self._database, session, user_id, self._clock, self._ids
+                            self._database,
+                            session,
+                            user_id,
+                            self._clock,
+                            self._ids,
+                            self._scheduler_owner_id,
                         )
+                        if self._scheduler_owner_id is not None:
+                            await tx.ensure_scheduler_fence()
                         try:
                             yield tx
                             tx.check_active()
@@ -303,11 +439,13 @@ class MongoTransaction:
         user_id: str,
         clock: Clock,
         ids: IdGenerator,
+        scheduler_owner_id: str | None = None,
     ) -> None:
         self._db = database
         self._session = session
         self._user = user_id
         self._clock, self._ids = clock, ids
+        self._scheduler_owner_id = scheduler_owner_id
         self._owner = asyncio.current_task()
         self.active = True
         self.failed = False
@@ -317,6 +455,32 @@ class MongoTransaction:
             self.active and self._owner is asyncio.current_task(),
             "Transaction is closed or belongs to another coroutine",
         )
+
+    @mutation
+    async def ensure_scheduler_fence(self) -> None:
+        owner_id = self._scheduler_owner_id
+        require(owner_id is not None, "Scheduler ownership is required")
+        now = self._clock.utc_now()
+        result = await self._collection("process_ownership").update_one(
+            {
+                "_id": OWNERSHIP_LEASE_ID,
+                "owner_id": owner_id,
+                "expires_at": {"$gt": now},
+            },
+            {
+                "$set": {
+                    "heartbeat_at": now,
+                    "expires_at": now + timedelta(seconds=OWNERSHIP_LEASE_SECONDS),
+                }
+            },
+            session=self._session,
+        )
+        if result.matched_count != 1:
+            raise HarnessError(
+                ErrorCode.CONCURRENCY_CONFLICT,
+                "Scheduler ownership lease was lost",
+                retryable=True,
+            )
 
     def _scope(self, user_id: str) -> None:
         self.check_active()
@@ -407,15 +571,11 @@ class MongoTransaction:
             "reserved": {"steps": 0, "tokens": 0, "tool_calls": 0},
             "unknown_usage_count": 0,
         }
-        await self._collection("budget_accounts").insert_one(
-            document, session=self._session
-        )
+        await self._collection("budget_accounts").insert_one(document, session=self._session)
         return document
 
     @mutation
-    async def reserve_budget(
-        self, reservation_id: str, task_id: str, amount: BudgetUsage
-    ) -> None:
+    async def reserve_budget(self, reservation_id: str, task_id: str, amount: BudgetUsage) -> None:
         self.check_active()
         requested = amount.reservation()
         existing = await self._collection("budget_reservations").find_one(
@@ -478,9 +638,7 @@ class MongoTransaction:
         )
 
     @mutation
-    async def reconcile_budget(
-        self, reservation_id: str, actual: BudgetUsage
-    ) -> None:
+    async def reconcile_budget(self, reservation_id: str, actual: BudgetUsage) -> None:
         row = await self._collection("budget_reservations").find_one(
             {"reservation_id": reservation_id, "user_id": self._user},
             session=self._session,
@@ -502,8 +660,7 @@ class MongoTransaction:
                 {
                     "$inc": {
                         **{
-                            f"reserved.{key}": -int(value)
-                            for key, value in row["reserved"].items()
+                            f"reserved.{key}": -int(value) for key, value in row["reserved"].items()
                         },
                         **{f"used.{key}": value for key, value in charged.items()},
                         **({"unknown_usage_count": 1} if usage_unknown else {}),
@@ -553,6 +710,371 @@ class MongoTransaction:
             BudgetUsage(**row["reserved"]),
             int(row["unknown_usage_count"]),
         )
+
+    @mutation
+    async def recover_run(self, run_id: str) -> None:
+        run = await self.get_run(run_id)
+        if run is None or not RUN_TRANSITIONS[run.status]:
+            return
+        tasks = await self.tasks(run_id)
+        task_map = {task.task_id: task for task in tasks}
+        root_task_id = str(json.loads(run.config.policy.text).get("root_task_id", ""))
+        invalid_tree = root_task_id not in task_map or (
+            root_task_id in task_map and task_map[root_task_id].parent_task_id is not None
+        )
+        for task in tasks:
+            if task.parent_task_id is not None:
+                parent = task_map.get(task.parent_task_id)
+                invalid_tree = invalid_tree or parent is None or parent.depth + 1 != task.depth
+            invalid_tree = invalid_tree or any(
+                dependency not in task_map for dependency in task.dependencies
+            )
+            ancestry: set[str] = set()
+            current = task
+            while current.parent_task_id is not None:
+                if current.task_id in ancestry:
+                    invalid_tree = True
+                    break
+                ancestry.add(current.task_id)
+                parent = task_map.get(current.parent_task_id)
+                if parent is None:
+                    invalid_tree = True
+                    break
+                current = parent
+        dependency_graph = {task.task_id: task.dependencies for task in tasks}
+        checked: set[str] = set()
+        visiting: set[str] = set()
+
+        def visit(task_id: str) -> None:
+            nonlocal invalid_tree
+            if task_id in visiting:
+                invalid_tree = True
+                return
+            if task_id in checked:
+                return
+            visiting.add(task_id)
+            for dependency_id in dependency_graph.get(task_id, ()):
+                visit(dependency_id)
+            visiting.remove(task_id)
+            checked.add(task_id)
+
+        for task_id in dependency_graph:
+            visit(task_id)
+        if invalid_tree:
+            for task in await self.tasks(run_id):
+                if task.status in {
+                    TaskStatus.PENDING,
+                    TaskStatus.READY,
+                    TaskStatus.RUNNING,
+                    TaskStatus.WAITING_CHILDREN,
+                    TaskStatus.WAITING_APPROVAL,
+                    TaskStatus.PAUSED,
+                }:
+                    await self.transition_task(
+                        task.task_id,
+                        task.version,
+                        TaskStatus.FAILED,
+                        error=JsonObject(
+                            json.dumps(
+                                {
+                                    "code": ErrorCode.STORAGE.value,
+                                    "message": "Persisted task tree failed recovery validation",
+                                }
+                            )
+                        ),
+                    )
+            await self.transition_run(
+                run_id,
+                run.version,
+                RunStatus.FAILED,
+                error=JsonObject(
+                    json.dumps(
+                        {
+                            "code": ErrorCode.STORAGE.value,
+                            "message": "Persisted task tree failed recovery validation",
+                        }
+                    )
+                ),
+            )
+            await self._event(
+                run_id,
+                "recovery.rejected",
+                details=JsonObject('{"reason":"invalid_task_tree"}'),
+            )
+            return
+
+        reservations = await self._find(
+            "budget_reservations",
+            {"run_id": run_id, "user_id": self._user, "status": "reserved"},
+            sort=(("reservation_id", ASCENDING),),
+        )
+        for reservation in reservations:
+            await self.reconcile_budget(
+                str(reservation["reservation_id"]),
+                BudgetUsage(steps=None, tokens=None, tool_calls=None),
+            )
+
+        for step in await self.steps(run_id):
+            if step.status == StepStatus.REQUESTED:
+                await self.update_step(
+                    step.step_id,
+                    StepStatus.REQUESTED,
+                    StepStatus.FAILED,
+                    error=JsonObject(
+                        json.dumps(
+                            {
+                                "code": ErrorCode.TRANSIENT_PROVIDER.value,
+                                "message": (
+                                    "Model attempt was interrupted before response acceptance"
+                                ),
+                                "retryable": True,
+                                "recovery_retry": True,
+                            }
+                        )
+                    ),
+                )
+
+        for invocation in await self.invocations(run_id):
+            if invocation.status != InvocationStatus.EXECUTING:
+                continue
+            status = (
+                InvocationStatus.UNKNOWN
+                if invocation.effect == Effect.NON_IDEMPOTENT_WRITE
+                else InvocationStatus.READY
+            )
+            await self.recover_invocation(invocation.invocation_id, status)
+
+        run = await self.get_run(run_id)
+        assert run is not None
+        if run.deadline is not None and run.deadline <= self._clock.utc_now():
+            for task in await self.tasks(run_id):
+                if task.status in {
+                    TaskStatus.PENDING,
+                    TaskStatus.READY,
+                    TaskStatus.RUNNING,
+                    TaskStatus.WAITING_CHILDREN,
+                    TaskStatus.WAITING_APPROVAL,
+                    TaskStatus.PAUSED,
+                }:
+                    await self.transition_task(
+                        task.task_id,
+                        task.version,
+                        TaskStatus.FAILED,
+                        error=JsonObject(
+                            json.dumps(
+                                {
+                                    "code": ErrorCode.DEADLINE_EXCEEDED.value,
+                                    "message": "Run deadline expired during recovery",
+                                }
+                            )
+                        ),
+                    )
+            await self.transition_run(
+                run_id,
+                run.version,
+                RunStatus.FAILED,
+                error=JsonObject(
+                    json.dumps(
+                        {
+                            "code": ErrorCode.DEADLINE_EXCEEDED.value,
+                            "message": "Run deadline expired during recovery",
+                        }
+                    )
+                ),
+            )
+            await self._event(
+                run_id,
+                "recovery.expired",
+                details=JsonObject('{"decision":"failed"}'),
+            )
+            return
+
+        if run.intent == ControlIntent.CANCEL:
+            for task in await self.tasks(run_id):
+                if task.status in {
+                    TaskStatus.PENDING,
+                    TaskStatus.READY,
+                    TaskStatus.RUNNING,
+                    TaskStatus.WAITING_CHILDREN,
+                    TaskStatus.WAITING_APPROVAL,
+                    TaskStatus.PAUSED,
+                }:
+                    await self.transition_task(
+                        task.task_id,
+                        task.version,
+                        TaskStatus.CANCELLED,
+                        error=JsonObject(
+                            json.dumps(
+                                {
+                                    "code": ErrorCode.CANCELLATION.value,
+                                    "message": "Run cancellation completed during recovery",
+                                }
+                            )
+                        ),
+                    )
+            await self.transition_run(
+                run_id,
+                run.version,
+                RunStatus.CANCELLED,
+                error=JsonObject(
+                    json.dumps(
+                        {
+                            "code": ErrorCode.CANCELLATION.value,
+                            "message": "Run cancellation completed during recovery",
+                        }
+                    )
+                ),
+            )
+            await self._event(
+                run_id,
+                "recovery.cancelled",
+                details=JsonObject('{"decision":"cancelled"}'),
+            )
+            return
+
+        should_pause = run.status in {RunStatus.QUEUED, RunStatus.RUNNING} or (
+            run.status == RunStatus.WAITING and run.intent == ControlIntent.PAUSE
+        )
+        should_pause = should_pause or run.status == RunStatus.PAUSED
+        if should_pause:
+            if run.intent == ControlIntent.NONE:
+                run = await self.set_intent(run_id, run.version, ControlIntent.PAUSE)
+            for task in await self.tasks(run_id):
+                if task.status not in {
+                    TaskStatus.READY,
+                    TaskStatus.RUNNING,
+                    TaskStatus.WAITING_CHILDREN,
+                    TaskStatus.WAITING_APPROVAL,
+                }:
+                    continue
+                paused_from = task.status.value
+                paused = await self.transition_task(task.task_id, task.version, TaskStatus.PAUSED)
+                await self._save_recovery_checkpoint(
+                    paused,
+                    paused_from=paused_from,
+                    reason="startup_recovery",
+                )
+            run = await self.get_run(run_id)
+            assert run is not None
+            if run.status != RunStatus.PAUSED:
+                run = await self.transition_run(run_id, run.version, RunStatus.PAUSED)
+            await self._event(
+                run_id,
+                "recovery.paused",
+                details=JsonObject('{"decision":"inspect_then_resume"}'),
+            )
+        elif run.status == RunStatus.WAITING:
+            await self._event(
+                run_id,
+                "recovery.waiting",
+                details=JsonObject('{"decision":"preserved_waiting_state"}'),
+            )
+
+    async def _save_recovery_checkpoint(self, task: Task, *, paused_from: str, reason: str) -> None:
+        previous = await self.load_checkpoint(task.task_id)
+        continuation = json.loads(previous.continuation.text) if previous is not None else {}
+        continuation["recovery"] = {"paused_from": paused_from, "reason": reason}
+        latest = await self._find(
+            "events",
+            {"run_id": task.run_id, "task_id": task.task_id, "user_id": self._user},
+            sort=(("sequence", DESCENDING),),
+            limit=1,
+        )
+        run_latest = await self._find(
+            "events",
+            {"run_id": task.run_id, "user_id": self._user},
+            sort=(("sequence", DESCENDING),),
+            limit=1,
+        )
+        sequence = int(run_latest[0]["sequence"]) if run_latest else 0
+        task_sequence = int(latest[0]["sequence"]) if latest else 0
+        await self.save_checkpoint(
+            Checkpoint(
+                task.task_id,
+                task.run_id,
+                task.user_id,
+                task.version,
+                max(sequence, task_sequence),
+                JsonObject(json.dumps(continuation)),
+                version=0 if previous is None else previous.version + 1,
+                schema_version=2,
+            ),
+            None if previous is None else previous.version,
+        )
+
+    @mutation
+    async def recover_invocation(self, invocation_id: str, status: InvocationStatus) -> Invocation:
+        invocation = await self.get_invocation(invocation_id)
+        require(
+            invocation is not None and invocation.status == InvocationStatus.EXECUTING,
+            "Only an interrupted executing invocation can be recovered",
+        )
+        assert invocation is not None
+        require(
+            status
+            == (
+                InvocationStatus.UNKNOWN
+                if invocation.effect == Effect.NON_IDEMPOTENT_WRITE
+                else InvocationStatus.READY
+            ),
+            "Recovery status does not match the invocation effect",
+        )
+        updated = replace(
+            invocation,
+            status=status,
+            error=(
+                JsonObject(
+                    json.dumps(
+                        {
+                            "code": ErrorCode.UNCERTAIN_SIDE_EFFECT.value,
+                            "message": (
+                                "Interrupted non-idempotent action requires explicit reconciliation"
+                            ),
+                        }
+                    )
+                )
+                if status == InvocationStatus.UNKNOWN
+                else None
+            ),
+        )
+        await self.save_invocation(updated, InvocationStatus.EXECUTING)
+        return updated
+
+    @mutation
+    async def reconcile_invocation(
+        self,
+        invocation_id: str,
+        *,
+        succeeded: bool,
+        result: JsonObject | None = None,
+        error: JsonObject | None = None,
+    ) -> Invocation:
+        invocation = await self.get_invocation(invocation_id)
+        require(
+            invocation is not None and invocation.status == InvocationStatus.UNKNOWN,
+            "Invocation is not awaiting reconciliation",
+        )
+        assert invocation is not None
+        run = await self.get_run(invocation.run_id)
+        require(
+            run is not None
+            and run.status == RunStatus.PAUSED
+            and run.intent == ControlIntent.PAUSE,
+            "Run must be paused before reconciling an uncertain invocation",
+        )
+        require(
+            (succeeded and result is not None and error is None)
+            or (not succeeded and error is not None and result is None),
+            "Provide exactly one outcome: a result for success or an error for failure",
+        )
+        updated = replace(
+            invocation,
+            status=InvocationStatus.SUCCEEDED if succeeded else InvocationStatus.FAILED,
+            result=result,
+            error=error,
+        )
+        await self.save_invocation(updated, InvocationStatus.UNKNOWN)
+        return updated
 
     @mutation
     async def record_completion_decision(
@@ -786,7 +1308,7 @@ class MongoTransaction:
         previous = await self.steps(step.run_id, step.task_id)
         require(step.ordinal == len(previous) + 1, "Step ordinals must be contiguous")
         require(
-            all(item.status == StepStatus.APPLIED for item in previous),
+            all(item.status in {StepStatus.APPLIED, StepStatus.FAILED} for item in previous),
             "Prior step is unresolved",
         )
         await self._collection("steps").insert_one(

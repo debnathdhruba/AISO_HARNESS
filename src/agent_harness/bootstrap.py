@@ -1,9 +1,9 @@
 """Explicit lifecycle wiring shared by CLI and local demonstrations."""
 
+import json
 from collections.abc import AsyncIterator
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
-import json
 from pathlib import Path
 
 from agent_harness.adapters.fake import offline_model
@@ -18,8 +18,8 @@ from agent_harness.artifacts.service import ArtifactService
 from agent_harness.config import Settings
 from agent_harness.domain.entities import JsonObject, Task
 from agent_harness.domain.errors import require
-from agent_harness.domain.tooling import Invocation
 from agent_harness.domain.model import RunOptions
+from agent_harness.domain.tooling import Invocation
 from agent_harness.models.gateway import ModelGateway
 from agent_harness.persistence.mongo import MongoStore
 from agent_harness.ports.model import ModelClient
@@ -68,7 +68,9 @@ def resource_scheduler(settings: Settings) -> ResourceScheduler:
 
 
 @asynccontextmanager
-async def application(settings: Settings) -> AsyncIterator[Application]:
+async def application(
+    settings: Settings, *, own_scheduler: bool = False
+) -> AsyncIterator[Application]:
     clock, ids = SystemClock(), UuidGenerator()
     scheduler = resource_scheduler(settings)
     task_scheduler = TaskScheduler(settings.task_concurrency, settings.task_queue_capacity)
@@ -76,12 +78,16 @@ async def application(settings: Settings) -> AsyncIterator[Application]:
     blocking_tools = BlockingToolAdapter(
         settings.blocking_tool_workers, settings.blocking_tool_queue_capacity
     )
-    async with MongoStore(
+    store = MongoStore(
         settings.mongodb_uri.get_secret_value(),
         settings.database_name,
         clock,
         ids,
-    ) as store:
+    )
+    async with AsyncExitStack() as stack:
+        await stack.enter_async_context(store)
+        if own_scheduler:
+            await stack.enter_async_context(store.scheduler_ownership())
         try:
             yield Application(
                 store,
@@ -163,6 +169,7 @@ async def runner(
             app.clock,
             app.scheduler,
             app.blocking_tools,
+            app.store.assert_scheduler_ownership,
         )
         agent = AgentRunner(
             app.store,
@@ -171,6 +178,7 @@ async def runner(
             app.ids,
             tools,
             app.agent_factory,
+            app.store.assert_scheduler_ownership,
         )
         agent_holder["agent"] = agent
         yield agent

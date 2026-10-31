@@ -9,10 +9,10 @@ import typer
 
 from agent_harness.bootstrap import application, runner
 from agent_harness.config import Settings, load_settings
-from agent_harness.domain.entities import Event, Run
+from agent_harness.domain.entities import Event, JsonObject, Run
 from agent_harness.domain.errors import HarnessError
 from agent_harness.domain.model import RunOptions
-from agent_harness.domain.states import RunStatus
+from agent_harness.domain.states import ControlIntent, RunStatus
 from agent_harness.models.codec import encode_step
 from agent_harness.tools.executor import decide_approval
 
@@ -33,12 +33,14 @@ def summary(run: Run) -> dict[str, object]:
 
 
 async def execute(settings: Settings, user: str, task: str | None, run_id: str | None) -> Run:
-    async with application(settings) as services:
+    async with application(settings, own_scheduler=True) as services:
         if run_id is None:
             assert task is not None
             run = await services.runs.submit(user, task, settings.run_options())
         else:
             run = await services.runs.inspect(user, run_id)
+            if run.status == RunStatus.PAUSED:
+                run = await services.runs.resume(user, run_id)
         typer.echo(f"run_id={run.run_id}", err=True)
         if run.status in {
             RunStatus.COMPLETED,
@@ -84,7 +86,7 @@ def run_command(
 
 
 async def chat(settings: Settings, user: str) -> None:
-    async with application(settings) as services:
+    async with application(settings, own_scheduler=True) as services:
         typer.echo("Agent ready. Enter a task; type 'exit' or press Ctrl+C to stop.")
         while True:
             try:
@@ -140,13 +142,122 @@ def continue_command(
     database_name: Annotated[str | None, typer.Option(help="MongoDB database name")] = None,
     config: Annotated[Path | None, typer.Option()] = None,
 ) -> None:
-    """Continue an interrupted Phase 2 run using its original deadline and models."""
+    """Resume a safely recovered run using its original deadline and models."""
     result = asyncio.run(
         execute(load_settings(config, database_name=database_name), user, None, run_id)
     )
     typer.echo(json.dumps(summary(result), indent=2))
     if result.status != RunStatus.COMPLETED:
         raise typer.Exit(1)
+
+
+@app.command("pause")
+def pause_command(
+    run_id: str,
+    user: Annotated[str, typer.Option()],
+    database_name: Annotated[str | None, typer.Option(help="MongoDB database name")] = None,
+) -> None:
+    """Persist a pause request; it takes effect at the next safe boundary."""
+
+    async def pause() -> Run:
+        async with application(load_settings(database_name=database_name)) as services:
+            return await services.runs.request_control(user, run_id, ControlIntent.PAUSE)
+
+    typer.echo(json.dumps(summary(asyncio.run(pause())), indent=2))
+
+
+@app.command("cancel")
+def cancel_command(
+    run_id: str,
+    user: Annotated[str, typer.Option()],
+    database_name: Annotated[str | None, typer.Option(help="MongoDB database name")] = None,
+) -> None:
+    """Persist cancellation; recovery completes it if the worker has stopped."""
+
+    async def cancel() -> Run:
+        async with application(load_settings(database_name=database_name)) as services:
+            return await services.runs.request_control(user, run_id, ControlIntent.CANCEL)
+
+    typer.echo(json.dumps(summary(asyncio.run(cancel())), indent=2))
+
+
+@app.command("resume")
+def resume_command(
+    run_id: str,
+    user: Annotated[str, typer.Option()],
+    database_name: Annotated[str | None, typer.Option(help="MongoDB database name")] = None,
+    config: Annotated[Path | None, typer.Option()] = None,
+) -> None:
+    """Resume a paused run after startup recovery and reconciliation."""
+    result = asyncio.run(
+        execute(load_settings(config, database_name=database_name), user, None, run_id)
+    )
+    typer.echo(json.dumps(summary(result), indent=2))
+    if result.status not in {RunStatus.COMPLETED, RunStatus.PARTIAL}:
+        raise typer.Exit(1)
+
+
+@app.command("recover")
+def recover_command(
+    run_id: str,
+    user: Annotated[str, typer.Option()],
+    database_name: Annotated[str | None, typer.Option(help="MongoDB database name")] = None,
+    config: Annotated[Path | None, typer.Option()] = None,
+) -> None:
+    """Run startup recovery and show decisions without resuming the selected run."""
+
+    async def recover() -> dict[str, object]:
+        settings = load_settings(config, database_name=database_name)
+        async with application(settings, own_scheduler=True) as services:
+            await services.runs.inspect(user, run_id)
+        return await inspect_run(settings, user, run_id, history=False)
+
+    typer.echo(json.dumps(asyncio.run(recover()), indent=2))
+
+
+@app.command("reconcile")
+def reconcile_command(
+    invocation_id: str,
+    user: Annotated[str, typer.Option()],
+    outcome: Annotated[str, typer.Option(help="Observed side-effect outcome: succeeded or failed")],
+    database_name: Annotated[str | None, typer.Option(help="MongoDB database name")] = None,
+    result_json: Annotated[
+        str | None, typer.Option(help="Observed JSON object result when outcome=succeeded")
+    ] = None,
+    error_message: Annotated[
+        str | None, typer.Option(help="Observed failure description when outcome=failed")
+    ] = None,
+) -> None:
+    """Resolve an unknown write only after independently checking its real outcome."""
+    if outcome not in {"succeeded", "failed"}:
+        raise typer.BadParameter("Outcome must be succeeded or failed")
+    result = JsonObject(result_json) if result_json is not None else None
+    error = (
+        JsonObject(json.dumps({"code": "tool_execution", "message": error_message}))
+        if error_message is not None
+        else None
+    )
+
+    async def reconcile() -> None:
+        async with application(load_settings(database_name=database_name)) as services:
+            async with services.store.transaction(user) as tx:
+                updated = await tx.reconcile_invocation(
+                    invocation_id,
+                    succeeded=outcome == "succeeded",
+                    result=result,
+                    error=error,
+                )
+        typer.echo(
+            json.dumps(
+                {
+                    "invocation_id": updated.invocation_id,
+                    "status": updated.status.value,
+                },
+                indent=2,
+            )
+        )
+
+    asyncio.run(reconcile())
 
 
 async def inspect_run(

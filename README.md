@@ -1,8 +1,8 @@
 # Agent Harness
 
-A standalone Python agent harness under phased development. Phases 2 through 6
-are implemented; Phases 5 and 6 await human review. Runs,
-model decisions, tool invocations, events and checkpoints persist in MongoDB.
+A standalone Python agent harness under phased development. Phases 2 through 7
+are implemented; Phases 5 through 7 await human review. Runs, model decisions,
+tool invocations, events and checkpoints persist in MongoDB.
 
 ## Run with Python
 
@@ -132,6 +132,46 @@ Children may read only artifact IDs explicitly included in their handoff.
 Inspect the durable task tree with `inspect RUN_ID --user USER`. Handoffs are
 shown only with `--history` or through the local `trace` command.
 
+## Recovery and controls (Phase 7)
+
+The CLI acquires a MongoDB-backed scheduler lease before running tasks. Only
+one process can own scheduling for a database; the owner renews its lease and
+checks it before model/tool work and before committing model decisions.
+Starting `run`, `chat`, `continue`, or `resume` performs startup recovery while
+holding that lease.
+
+After restarting an interrupted worker, inspect recovery decisions without
+resuming a selected run:
+
+```powershell
+.\.venv\Scripts\python.exe -m agent_harness.interfaces.cli recover RUN_ID --user local-user --config examples/ollama.toml
+```
+
+Recovery validates the task tree, reconciles stale budget reservations
+conservatively, fails interrupted model requests for at-most-one recovery retry,
+replays read-only/idempotent tool invocations, and marks interrupted
+non-idempotent writes `unknown`. Active work is checkpointed as paused; expired
+runs are failed, not revived. Inspect the result with `inspect` or `trace`.
+Before resuming, independently determine the real outcome of each unknown write
+and record it:
+
+```powershell
+.\.venv\Scripts\python.exe -m agent_harness.interfaces.cli reconcile INVOCATION_ID --user local-user --outcome succeeded --result-json '{"ok":true}' --config examples/ollama.toml
+.\.venv\Scripts\python.exe -m agent_harness.interfaces.cli resume RUN_ID --user local-user --config examples/ollama.toml
+```
+
+Use `--outcome failed --error-message "..."` to record an observed failure.
+Never mark an unknown write successful without checking its external effect.
+Control requests are persisted and take effect at safe boundaries:
+
+```powershell
+.\.venv\Scripts\python.exe -m agent_harness.interfaces.cli pause RUN_ID --user local-user
+.\.venv\Scripts\python.exe -m agent_harness.interfaces.cli cancel RUN_ID --user local-user
+```
+
+`inspect` and control/reconciliation commands do not acquire scheduler
+ownership; only a run worker or explicit `recover` command does.
+
 ## Budgets and completion validation (Phase 6)
 
 Each model request reserves a step and token allowance before it starts; each
@@ -189,8 +229,9 @@ updates use `uv lock --upgrade`, followed by every quality check and lock review
 
 See [architecture](docs/architecture.md), [decisions](docs/decisions/README.md),
 [state contracts](docs/durable-state.md), [phase tracker](docs/progress.md), and
-[Phase 1 review](docs/reviews/phase-01.md) and
-[Phase 5/MongoDB handoff](docs/reviews/phase-05.md).
+[Phase 1 review](docs/reviews/phase-01.md),
+[Phase 5/MongoDB handoff](docs/reviews/phase-05.md), and
+[Phase 7 recovery handoff](docs/reviews/phase-07.md).
 
 ## Persisted-state demonstration
 

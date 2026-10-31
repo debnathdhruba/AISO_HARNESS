@@ -2,13 +2,14 @@
 
 import asyncio
 import json
+from collections.abc import Awaitable, Callable
 from dataclasses import replace
 
 from agent_harness.agents.factory import AgentFactory, local_agent_registry
 from agent_harness.application.completion import validate_completion
 from agent_harness.domain.budgets import BudgetUsage
 from agent_harness.domain.entities import Checkpoint, JsonObject, Run
-from agent_harness.domain.errors import ErrorCode, HarnessError, require
+from agent_harness.domain.errors import ErrorCode, HarnessError, PauseRequested, require
 from agent_harness.domain.model import (
     FinishReason,
     Message,
@@ -62,10 +63,12 @@ class AgentRunner:
         ids: IdGenerator,
         tools: ToolExecutor | None = None,
         agent_factory: AgentFactory | None = None,
+        ownership_check: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         self._store, self._model, self._clock, self._ids = store, model, clock, ids
         self._tools = tools
         self._agent_factory = agent_factory or AgentFactory(local_agent_registry())
+        self._ownership_check = ownership_check
         self._run_locks: dict[tuple[str, str], tuple[asyncio.Lock, int]] = {}
         self._run_locks_guard = asyncio.Lock()
 
@@ -75,9 +78,7 @@ class AgentRunner:
     async def execute_task(self, user_id: str, run_id: str, task_id: str) -> Run:
         return await self._execute_locked(user_id, run_id, task_id)
 
-    async def _execute_locked(
-        self, user_id: str, run_id: str, task_id: str | None
-    ) -> Run:
+    async def _execute_locked(self, user_id: str, run_id: str, task_id: str | None) -> Run:
         lock_key = (run_id, task_id or "root")
         async with self._run_locks_guard:
             lock, users = self._run_locks.get(lock_key, (asyncio.Lock(), 0))
@@ -102,6 +103,7 @@ class AgentRunner:
         *,
         completion_feedback: str | None = None,
         completion_failures: int | None = None,
+        recovery: dict[str, str] | None = None,
     ) -> None:
         task = await tx.get_task(task_id)
         assert task is not None
@@ -109,13 +111,13 @@ class AgentRunner:
         after = previous.last_event_sequence if previous is not None else 0
         events = await tx.events(run.run_id, after=after, limit=1000)
         sequence = events[-1].sequence if events else after
-        continuation = (
-            json.loads(previous.continuation.text) if previous is not None else {}
-        )
+        continuation = json.loads(previous.continuation.text) if previous is not None else {}
         if completion_feedback is not None:
             continuation["completion_feedback"] = completion_feedback
         if completion_failures is not None:
             continuation["completion_failures"] = completion_failures
+        if recovery is not None:
+            continuation["recovery"] = recovery
         continuation.update(
             {
                 "step_id": step.step_id if step else None,
@@ -131,6 +133,7 @@ class AgentRunner:
                 last_event_sequence=sequence,
                 continuation=JsonObject(json.dumps(continuation)),
                 version=0 if previous is None else previous.version + 1,
+                schema_version=2,
             ),
             None if previous is None else previous.version,
         )
@@ -146,6 +149,8 @@ class AgentRunner:
         verified: bool = False,
         step: Step | None = None,
     ) -> Run:
+        if self._ownership_check is not None:
+            await self._ownership_check()
         async with self._store.transaction(user_id) as tx:
             run = await tx.get_run(run_id)
             task = await tx.get_task(task_id)
@@ -155,10 +160,25 @@ class AgentRunner:
             root_task_id = str(json.loads(run.config.policy.text)["root_task_id"])
             is_root = task_id == root_task_id
             if error is None and run.intent == ControlIntent.PAUSE:
+                paused_from = task.status.value
                 if not is_root:
-                    await tx.transition_task(task_id, task.version, TaskStatus.PAUSED)
+                    task = await tx.transition_task(task_id, task.version, TaskStatus.PAUSED)
+                    await self._checkpoint(
+                        tx,
+                        run,
+                        task_id,
+                        step,
+                        recovery={"paused_from": paused_from, "reason": "control_request"},
+                    )
                     return run
-                await tx.transition_task(task_id, task.version, TaskStatus.PAUSED)
+                task = await tx.transition_task(task_id, task.version, TaskStatus.PAUSED)
+                await self._checkpoint(
+                    tx,
+                    run,
+                    task_id,
+                    step,
+                    recovery={"paused_from": paused_from, "reason": "control_request"},
+                )
                 return await tx.transition_run(run_id, run.version, RunStatus.PAUSED)
             if error is None and run.intent == ControlIntent.CANCEL:
                 error = HarnessError(ErrorCode.CANCELLATION, "Run cancellation requested")
@@ -166,9 +186,7 @@ class AgentRunner:
                 error = HarnessError(ErrorCode.DEADLINE_EXCEEDED, "Run deadline exceeded")
             if error is None and is_root:
                 children = tuple(
-                    child
-                    for child in await tx.tasks(run_id)
-                    if child.parent_task_id == task_id
+                    child for child in await tx.tasks(run_id) if child.parent_task_id == task_id
                 )
                 incomplete = tuple(
                     child
@@ -206,6 +224,25 @@ class AgentRunner:
                 children = ()
                 partial_allowed = False
             cancelled = error is not None and error.code == ErrorCode.CANCELLATION
+            if cancelled and (is_root or run.intent == ControlIntent.CANCEL):
+                assert error is not None
+                for child in await tx.tasks(run_id):
+                    if child.task_id == task_id:
+                        continue
+                    if child.status in {
+                        TaskStatus.PENDING,
+                        TaskStatus.READY,
+                        TaskStatus.RUNNING,
+                        TaskStatus.WAITING_CHILDREN,
+                        TaskStatus.WAITING_APPROVAL,
+                        TaskStatus.PAUSED,
+                    }:
+                        await tx.transition_task(
+                            child.task_id,
+                            child.version,
+                            TaskStatus.CANCELLED,
+                            error=safe_error(error),
+                        )
             result = (
                 JsonObject(
                     json.dumps(
@@ -309,28 +346,41 @@ class AgentRunner:
             0, (run.deadline - self._clock.utc_now()).total_seconds()
         )
         while True:
+            if self._ownership_check is not None:
+                await self._ownership_check()
             async with self._store.transaction(user_id) as tx:
                 current = await tx.get_run(run_id)
                 steps = await tx.steps(run_id, task_id)
                 invocations = tuple(
-                    item
-                    for item in await tx.invocations(run_id)
-                    if item.task_id == task_id
+                    item for item in await tx.invocations(run_id) if item.task_id == task_id
                 )
             succeeded = {i.tool_name for i in invocations if i.status.value == "succeeded"}
             outstanding_tools = tuple(
                 name for name in options.required_tools if name not in succeeded
             )
             assert current is not None
+            latest = steps[-1] if steps else None
             if not RUN_TRANSITIONS[current.status] or current.status == RunStatus.PAUSED:
                 return current
             if current.intent == ControlIntent.PAUSE:
-                # Pause is recorded but automatic resume/control is a later phase.
                 async with self._store.transaction(user_id) as tx:
                     task = await tx.get_task(task_id)
                     assert task is not None
-                    await tx.transition_task(task_id, task.version, TaskStatus.PAUSED)
-                    return await tx.transition_run(run_id, current.version, RunStatus.PAUSED)
+                    paused_from = task.status.value
+                    if task.status != TaskStatus.PAUSED:
+                        task = await tx.transition_task(task_id, task.version, TaskStatus.PAUSED)
+                    current = await tx.get_run(run_id)
+                    assert current is not None
+                    await self._checkpoint(
+                        tx,
+                        current,
+                        task_id,
+                        latest,
+                        recovery={"paused_from": paused_from, "reason": "control_request"},
+                    )
+                    if current.status != RunStatus.PAUSED:
+                        current = await tx.transition_run(run_id, current.version, RunStatus.PAUSED)
+                    return current
             if current.intent == ControlIntent.CANCEL:
                 return await self._finish(
                     user_id,
@@ -349,7 +399,7 @@ class AgentRunner:
                     task_id,
                     error=HarnessError(ErrorCode.DEADLINE_EXCEEDED, "Run deadline exceeded"),
                 )
-            latest = steps[-1] if steps else None
+            retry_stage: Stage | None = None
             if latest is not None and latest.status == StepStatus.ACCEPTED:
                 response = latest.response
                 assert response is not None
@@ -366,6 +416,35 @@ class AgentRunner:
                     else:
                         try:
                             resolved = await self._tools.process(latest, options)
+                        except PauseRequested:
+                            async with self._store.transaction(user_id) as tx:
+                                current_task = await tx.get_task(task_id)
+                                current_run = await tx.get_run(run_id)
+                                assert current_task is not None and current_run is not None
+                                paused_from = current_task.status.value
+                                if current_task.status != TaskStatus.PAUSED:
+                                    current_task = await tx.transition_task(
+                                        task_id,
+                                        current_task.version,
+                                        TaskStatus.PAUSED,
+                                    )
+                                await self._checkpoint(
+                                    tx,
+                                    current_run,
+                                    task_id,
+                                    latest,
+                                    recovery={
+                                        "paused_from": paused_from,
+                                        "reason": "delegated_work_paused",
+                                    },
+                                )
+                                if current_run.status != RunStatus.PAUSED:
+                                    current_run = await tx.transition_run(
+                                        run_id,
+                                        current_run.version,
+                                        RunStatus.PAUSED,
+                                    )
+                                return current_run
                         except HarnessError as tool_error:
                             return await self._finish(user_id, run_id, task_id, error=tool_error)
                         except asyncio.CancelledError:
@@ -454,18 +533,13 @@ class AgentRunner:
                             ),
                             pending_required_children=(
                                 pending_children
-                                or (
-                                    failed_children
-                                    and options.partial_result_policy != "allow"
-                                )
+                                or (failed_children and options.partial_result_policy != "allow")
                             ),
                             cancelled=False,
                             expired=self._clock.utc_now() >= run.deadline,
                             default_schema=options.result_schema,
                         )
-                        await tx.record_completion_decision(
-                            run_id, task_id, decision.payload()
-                        )
+                        await tx.record_completion_decision(run_id, task_id, decision.payload())
                     if not decision.passed:
                         correction_feedback = "; ".join(decision.reasons)
                         if completion_failures < options.max_corrections:
@@ -522,8 +596,7 @@ class AgentRunner:
                             task_id,
                             BudgetUsage(
                                 steps=1,
-                                tokens=options.max_input_bytes
-                                + latest.request.max_output_tokens,
+                                tokens=options.max_input_bytes + latest.request.max_output_tokens,
                                 tool_calls=0,
                             ),
                         )
@@ -552,13 +625,26 @@ class AgentRunner:
                     and json.loads(item.error.text).get("code")
                     == ErrorCode.TRANSIENT_PROVIDER.value
                 )
-                if (
+                recovery_attempts = sum(
+                    1
+                    for item in steps
+                    if item.status == StepStatus.FAILED
+                    and item.error is not None
+                    and json.loads(item.error.text).get("recovery_retry") is True
+                )
+                recovery_retry = (
+                    latest.error is not None
+                    and json.loads(latest.error.text).get("recovery_retry") is True
+                    and recovery_attempts == 1
+                )
+                if recovery_retry or (
                     options.retry_strategy == "transient_provider"
                     and error.retryable
                     and retryable_attempts <= options.max_retries
                 ):
-                    continue
-                return await self._finish(user_id, run_id, task_id, error=error)
+                    retry_stage = latest.stage
+                else:
+                    return await self._finish(user_id, run_id, task_id, error=error)
             if len(steps) >= options.max_steps:
                 return await self._finish(
                     user_id,
@@ -566,13 +652,12 @@ class AgentRunner:
                     task_id,
                     error=HarnessError(ErrorCode.BUDGET_EXCEEDED, "Model step limit exhausted"),
                 )
-            stage = (
+            stage = retry_stage or (
                 Stage.DECISION
                 if completion_feedback
                 and self._tools is not None
                 and (latest is None or latest.stage == Stage.RESPONSE)
-                else
-                Stage.RESPONSE
+                else Stage.RESPONSE
                 if options.routing_mode == "chat"
                 else Stage.DECISION
                 if not steps
@@ -642,8 +727,7 @@ class AgentRunner:
                     task.objective
                     + (
                         "\n\nCompletion checks rejected the previous candidate. "
-                        "Correct only these issues: "
-                        + completion_feedback
+                        "Correct only these issues: " + completion_feedback
                         if completion_feedback
                         else ""
                     )
@@ -682,6 +766,8 @@ class AgentRunner:
             step = Step(
                 self._ids.new_id(), task_id, run_id, user_id, len(steps) + 1, stage, request
             )
+            if self._ownership_check is not None:
+                await self._ownership_check()
             async with self._store.transaction(user_id) as tx:
                 await tx.reserve_budget(
                     f"model:{step.step_id}",
@@ -738,6 +824,8 @@ class AgentRunner:
                 if isinstance(caught, asyncio.CancelledError):
                     raise
                 return failed
+            if self._ownership_check is not None:
+                await self._ownership_check()
             async with self._store.transaction(user_id) as tx:
                 accepted = await tx.update_step(
                     step.step_id, StepStatus.REQUESTED, StepStatus.ACCEPTED, response=response

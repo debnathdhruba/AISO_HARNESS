@@ -9,7 +9,7 @@ from uuid import UUID, uuid5
 from agent_harness.agents.factory import AgentFactory
 from agent_harness.agents.scheduler import TaskScheduler
 from agent_harness.domain.entities import JsonObject, Task
-from agent_harness.domain.errors import ErrorCode, HarnessError, require
+from agent_harness.domain.errors import ErrorCode, HarnessError, PauseRequested, require
 from agent_harness.domain.model import RunOptions
 from agent_harness.domain.states import TaskStatus
 from agent_harness.ports.state import Clock, IdGenerator, StateStore
@@ -85,9 +85,7 @@ class TaskCoordinator:
         resolved: set[str] = set()
         ordered: list[DelegatedTask] = []
         while remaining:
-            ready = next(
-                (spec for spec in remaining if set(spec.dependencies) <= resolved), None
-            )
+            ready = next((spec for spec in remaining if set(spec.dependencies) <= resolved), None)
             if ready is None:
                 raise HarnessError(
                     ErrorCode.VALIDATION,
@@ -389,9 +387,11 @@ class TaskCoordinator:
                 parent.agent_definition_id, parent.agent_definition_version
             )
             limit = min(definition.max_active_children, self.scheduler.concurrency)
-            await self.scheduler.run(
-                ready, execute_task, active_limit=limit
-            )
+            await self.scheduler.run(ready, execute_task, active_limit=limit)
+            async with self.store.transaction(user_id) as tx:
+                refreshed_after_run = await tx.tasks(children[0].run_id)
+            if any(child.status == TaskStatus.PAUSED for child in refreshed_after_run):
+                raise PauseRequested()
         async with self.store.transaction(user_id) as tx:
             current_parent = await tx.get_task(parent_task_id)
             assert current_parent is not None

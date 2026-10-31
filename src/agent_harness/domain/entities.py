@@ -182,13 +182,13 @@ class Checkpoint:
     last_event_sequence: int
     continuation: JsonObject
     version: int = 0
-    schema_version: int = 1
+    schema_version: int = 2
 
     def __post_init__(self) -> None:
         identifier(self.task_id)
         identifier(self.run_id)
         require(bool(self.user_id.strip()), "Checkpoint user required")
-        require(self.schema_version == 1, "Unsupported checkpoint schema version")
+        require(self.schema_version in {1, 2}, "Unsupported checkpoint schema version")
         require(
             self.state_version >= 0 and self.version >= 0 and self.last_event_sequence > 0,
             "Invalid checkpoint version/sequence",

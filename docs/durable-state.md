@@ -15,9 +15,10 @@ injected. Principals are explicit strings, not agent names.
 
 Snapshots are frozen dataclasses with validated canonical JSON objects for
 structured payloads. Never put futures, connections, credentials or callables in
-continuations. Schema version 1 is supported for snapshots/events/checkpoints;
-unknown versions fail rather than being silently accepted. Typed provider/model
-contracts, attempt records and agent definitions will be introduced as consumed.
+continuations. Event schema version 1 and checkpoint schema versions 1 and 2 are
+supported; unknown versions fail rather than being silently accepted. Typed
+provider/model contracts, attempt records and agent definitions will be
+introduced as consumed.
 
 ## Transactions and repositories
 
@@ -41,8 +42,7 @@ enforce key and optimistic-concurrency invariants; repository methods validate
 relationship scope. Atlas replica-set support is required for transactions. Do
 not await model/tool work, resource admission or approval inside a transaction.
 Transactions must not be nested or shared with another coroutine. The harness
-still assumes one owning service process; cross-process scheduling ownership is
-future recovery work.
+uses a MongoDB lease to enforce one owning scheduler process per database.
 
 `get_run`, `get_task`, `load_checkpoint` return None for missing or unowned IDs.
 Event queries return only the principal's records, ordered by per-run sequence,
@@ -50,9 +50,9 @@ with exclusive `after` pagination and a 1..1000 page size. Mutation methods reje
 unowned state. Status updates require the current expected version and increment
 it exactly once. Conflicts use the machine-readable concurrency_conflict code.
 
-Control intent is durable independently of status: recording cancellation does
-not claim that work has stopped. Cancellation intent cannot be revoked. This
-phase records intent only; scheduling and cancellation effects come later.
+Control intent is durable independently of status: recording pause or
+cancellation does not claim that work has stopped. Control requests take effect
+at safe execution boundaries; cancellation intent cannot be revoked.
 
 ## MongoDB collections
 
@@ -70,6 +70,7 @@ phase records intent only; scheduling and cancellation effects come later.
 | artifacts | artifact UUID; user/run/task/name/version unique index | Bounded artifact manifest and integrity metadata |
 | budget_accounts | task UUID; run/user index | Hierarchical limits, used/reserved totals, unknown usage count |
 | budget_reservations | reservation UUID; run/task/status index | Idempotent per-operation reservation and reconciliation state |
+| process_ownership | fixed scheduler lease ID | Expiring scheduler owner lease, process ID, and heartbeat |
 
 Collections and indexes are ensured at application startup; MongoDB has no
 SQLite-style numbered schema migrations here. Existing local SQLite databases
@@ -104,6 +105,41 @@ The legacy `SQLiteStore` remains for existing local development compatibility;
 its Phase 6 budget counters are process-local only and it does not persist
 budget or completion records. Production composition uses MongoDB. MongoDB
 transaction behavior has not been live-validated against Atlas for this phase.
+
+## Recovery and process ownership (Phase 7)
+
+The fixed `process_ownership` document is a MongoDB lease with owner UUID,
+process ID, heartbeat, and expiry. A scheduler process must acquire the lease
+before startup recovery or task execution. A heartbeat renews it; loss of the
+lease stops new model/tool admissions and prevents the stale process from
+committing model decisions. Scheduler-owned transactions conditionally renew
+the lease inside the Mongo transaction as a fencing check. Read-only inspection
+and persisted control requests do not acquire the scheduling lease.
+
+Startup recovery runs under the lease. It validates task parent/dependency
+references and cycles, conservatively reconciles stale budget reservations,
+marks interrupted model requests as failed and eligible for one recovery retry,
+requeues interrupted read-only/idempotent invocations, and marks interrupted
+non-idempotent writes `unknown`. It pauses still-live runs with schema-version-2
+checkpoints and fails expired runs rather than extending their original
+deadlines. Delegation records and accepted model decisions remain immutable,
+so replay uses their existing idempotency keys and does not create duplicate
+children or tool intents.
+
+Unknown invocation outcomes can be resolved through the explicit reconciliation
+port/CLI only while the run is paused. The caller must independently verify the
+side effect and provide exactly one observed result or failure; resuming is
+blocked while unknown outcomes remain. `recover RUN_ID --user USER` performs
+startup recovery and displays the resulting state without resuming that run.
+`resume` is explicit and retains the original run deadline and configuration.
+Control intent is durable: `pause` takes effect at a safe boundary, while
+`cancel` is finalized at a safe boundary or during startup recovery.
+
+Checkpoint schema version 1 remains readable. New checkpoints use schema
+version 2 and preserve the recovery decision in their continuation. Event
+schema remains version 1. This phase has not been tested against a live MongoDB
+deployment; lease behavior, transaction fencing, and restart semantics still
+need deployment-level validation.
 
 ## Database and agent trace
 
@@ -167,13 +203,13 @@ every source/target pair. No self-transitions or terminal reopenings are allowed
 | Task | running | waiting_children, waiting_approval, paused, succeeded, failed, cancelled |
 | Task | waiting_children | ready, paused, blocked, failed, cancelled |
 | Task | waiting_approval | ready, paused, failed, cancelled |
-| Task | paused | pending, failed, cancelled |
+| Task | paused | pending, ready, failed, cancelled |
 | Task | succeeded / failed / cancelled / blocked | none |
 | Invocation | planned | awaiting_approval, ready, failed, cancelled |
 | Invocation | awaiting_approval | ready, failed, cancelled |
 | Invocation | ready | executing, failed, cancelled |
-| Invocation | executing | succeeded, failed, cancelled, unknown |
-| Invocation | unknown | succeeded, failed, via future explicit reconciliation only |
+| Invocation | executing | ready (safe recovery replay), succeeded, failed, cancelled, unknown |
+| Invocation | unknown | succeeded, failed, via explicit reconciliation only |
 | Invocation | succeeded / failed / cancelled | none |
 
 Invocation transition validation does not by itself prove task acceptance
@@ -181,7 +217,7 @@ criteria or authorize side effects; those checks belong to application services.
 
 ## Limitations
 
-The API enforces principal scope but is not an authentication service. No process
-ownership lock, crash recovery scheduler, or startup reconciliation exists yet;
-those belong to Phase 7. Atlas transaction behavior and cross-process budget
-admission remain unverified.
+The API enforces principal scope but is not an authentication service. MongoDB
+lease behavior, transaction fencing, and restart semantics have not been
+validated against a live deployment. Atlas transaction behavior and
+cross-process budget admission remain unverified.

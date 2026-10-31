@@ -257,6 +257,42 @@ class SQLiteTransaction:
             status=invocation.status,
         )
 
+    @mutation
+    async def reconcile_invocation(
+        self,
+        invocation_id: str,
+        *,
+        succeeded: bool,
+        result: JsonObject | None = None,
+        error: JsonObject | None = None,
+    ) -> Invocation:
+        invocation = await self.get_invocation(invocation_id)
+        require(
+            invocation is not None and invocation.status == InvocationStatus.UNKNOWN,
+            "Invocation is not awaiting reconciliation",
+        )
+        assert invocation is not None
+        run = await self.get_run(invocation.run_id)
+        require(
+            run is not None
+            and run.status == RunStatus.PAUSED
+            and run.intent == ControlIntent.PAUSE,
+            "Run must be paused before reconciling an uncertain invocation",
+        )
+        require(
+            (succeeded and result is not None and error is None)
+            or (not succeeded and error is not None and result is None),
+            "Provide exactly one outcome: a result for success or an error for failure",
+        )
+        updated = replace(
+            invocation,
+            status=InvocationStatus.SUCCEEDED if succeeded else InvocationStatus.FAILED,
+            result=result,
+            error=error,
+        )
+        await self.save_invocation(updated, InvocationStatus.UNKNOWN)
+        return updated
+
     async def get_approval(self, invocation_id: str) -> Approval | None:
         self.check_active()
         async with self._db.execute(
@@ -373,7 +409,10 @@ class SQLiteTransaction:
         )
         previous = await self.steps(step.run_id, step.task_id)
         require(step.ordinal == len(previous) + 1, "Step ordinals must be contiguous")
-        require(all(s.status == StepStatus.APPLIED for s in previous), "Prior step is unresolved")
+        require(
+            all(s.status in {StepStatus.APPLIED, StepStatus.FAILED} for s in previous),
+            "Prior step is unresolved",
+        )
         await self._db.execute(
             "INSERT INTO steps VALUES (?, ?, ?, ?, ?, ?, ?)",
             (
@@ -667,16 +706,15 @@ class SQLiteTransaction:
                 parent_account.limits.tool_calls,
             )
         account = _LegacyBudgetAccount(
-            limits, {"steps": 0, "tokens": 0, "tool_calls": 0},
+            limits,
+            {"steps": 0, "tokens": 0, "tool_calls": 0},
             {"steps": 0, "tokens": 0, "tool_calls": 0},
         )
         self._budget_accounts[task.task_id] = account
         return account
 
     @mutation
-    async def reserve_budget(
-        self, reservation_id: str, task_id: str, amount: BudgetUsage
-    ) -> None:
+    async def reserve_budget(self, reservation_id: str, task_id: str, amount: BudgetUsage) -> None:
         requested = amount.reservation()
         existing = self._budget_reservations.get(reservation_id)
         if existing is not None:
@@ -710,9 +748,7 @@ class SQLiteTransaction:
         )
 
     @mutation
-    async def reconcile_budget(
-        self, reservation_id: str, actual: BudgetUsage
-    ) -> None:
+    async def reconcile_budget(self, reservation_id: str, actual: BudgetUsage) -> None:
         reservation = self._budget_reservations.get(reservation_id)
         require(
             reservation is not None and reservation.user_id == self._user,
@@ -768,8 +804,7 @@ class SQLiteTransaction:
     async def tasks(self, run_id: str) -> tuple[Task, ...]:
         self.check_active()
         async with self._db.execute(
-            "SELECT snapshot FROM tasks WHERE run_id=? AND user_id=? "
-            "ORDER BY rowid",
+            "SELECT snapshot FROM tasks WHERE run_id=? AND user_id=? ORDER BY rowid",
             (run_id, self._user),
         ) as cursor:
             rows = await cursor.fetchall()
@@ -786,9 +821,7 @@ class SQLiteTransaction:
         return decode_task(str(row[0])) if row else None
 
     @mutation
-    async def save_delegation(
-        self, parent_task_id: str, idempotency_key: str, task: Task
-    ) -> None:
+    async def save_delegation(self, parent_task_id: str, idempotency_key: str, task: Task) -> None:
         self._scope(task.user_id)
         parent = await self.get_task(parent_task_id)
         require(

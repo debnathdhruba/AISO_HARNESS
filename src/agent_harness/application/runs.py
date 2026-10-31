@@ -9,7 +9,7 @@ from agent_harness.application.routing import select_mode
 from agent_harness.domain.entities import JsonObject, Run, RunConfig, Task
 from agent_harness.domain.errors import ErrorCode, HarnessError
 from agent_harness.domain.model import RunOptions
-from agent_harness.domain.states import RunStatus, TaskStatus
+from agent_harness.domain.states import ControlIntent, RunStatus, TaskStatus
 from agent_harness.ports.state import Clock, IdGenerator, StateStore
 
 
@@ -89,3 +89,32 @@ class RunService:
         if run is None:
             raise HarnessError(ErrorCode.AUTHORIZATION, "Run is unavailable to this principal")
         return run
+
+    async def request_control(self, user_id: str, run_id: str, intent: ControlIntent) -> Run:
+        if intent == ControlIntent.NONE:
+            raise HarnessError(ErrorCode.VALIDATION, "Control intent cannot be empty")
+        async with self._store.transaction(user_id) as tx:
+            run = await tx.get_run(run_id)
+            if run is None:
+                raise HarnessError(ErrorCode.AUTHORIZATION, "Run is unavailable to this principal")
+            return await tx.set_intent(run_id, run.version, intent)
+
+    async def resume(self, user_id: str, run_id: str) -> Run:
+        async with self._store.transaction(user_id) as tx:
+            run = await tx.get_run(run_id)
+            if run is None:
+                raise HarnessError(ErrorCode.AUTHORIZATION, "Run is unavailable to this principal")
+            if run.status != RunStatus.PAUSED or run.intent != ControlIntent.PAUSE:
+                raise HarnessError(
+                    ErrorCode.VALIDATION,
+                    "Only an explicitly paused run can be resumed",
+                )
+            if run.deadline is not None and run.deadline <= self._clock.utc_now():
+                raise HarnessError(
+                    ErrorCode.DEADLINE_EXCEEDED, "Run deadline expired before resume"
+                )
+            for task in await tx.tasks(run_id):
+                if task.status == TaskStatus.PAUSED:
+                    await tx.transition_task(task.task_id, task.version, TaskStatus.READY)
+            run = await tx.set_intent(run_id, run.version, ControlIntent.NONE)
+            return await tx.transition_run(run_id, run.version, RunStatus.QUEUED)

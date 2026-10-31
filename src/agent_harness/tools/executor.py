@@ -2,13 +2,14 @@
 
 import asyncio
 import json
+from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from datetime import timedelta
 from uuid import UUID, uuid5
 
 from agent_harness.domain.budgets import BudgetUsage
 from agent_harness.domain.entities import JsonObject
-from agent_harness.domain.errors import ErrorCode, HarnessError, require
+from agent_harness.domain.errors import ErrorCode, HarnessError, PauseRequested, require
 from agent_harness.domain.model import Message, Role, RunOptions, Step
 from agent_harness.domain.states import InvocationStatus
 from agent_harness.domain.tooling import Approval, Effect, Invocation, argument_hash
@@ -37,10 +38,12 @@ class ToolExecutor:
         clock: Clock,
         scheduler: ResourceScheduler | None = None,
         blocking_tools: BlockingToolAdapter | None = None,
+        ownership_check: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         self.store, self.registry, self.clock = store, registry, clock
         self.scheduler = scheduler or ResourceScheduler()
         self.blocking_tools = blocking_tools or BlockingToolAdapter()
+        self.ownership_check = ownership_check
 
     async def _change(
         self,
@@ -191,10 +194,17 @@ class ToolExecutor:
                 "Tool contract changed after the decision was accepted",
             )
             self.registry.validate(invocation.arguments, tool.spec.input_schema)
+            if self.ownership_check is not None:
+                await self.ownership_check()
             async with self.store.transaction(step.user_id) as tx:
                 run = await tx.get_run(step.run_id)
             assert run is not None and run.deadline is not None
-            require(run.intent.value == "none", "Run control intent prevents tool execution")
+            if run.intent.value == "cancel":
+                raise HarnessError(
+                    ErrorCode.CANCELLATION, "Run cancellation requested before tool execution"
+                )
+            if run.intent.value == "pause":
+                raise PauseRequested()
             remaining = (run.deadline - self.clock.utc_now()).total_seconds()
             if remaining <= 0:
                 raise HarnessError(ErrorCode.DEADLINE_EXCEEDED, "Run deadline exceeded before tool")
@@ -210,11 +220,27 @@ class ToolExecutor:
                     BudgetUsage(steps=0, tokens=0, tool_calls=1),
                 )
             invocation = await self._change(invocation, InvocationStatus.EXECUTING)
+            execution_started = False
             try:
+                if self.ownership_check is not None:
+                    await self.ownership_check()
+                async with self.store.transaction(step.user_id) as tx:
+                    current_run = await tx.get_run(step.run_id)
+                assert current_run is not None
+                if current_run.intent.value == "cancel":
+                    raise HarnessError(
+                        ErrorCode.CANCELLATION,
+                        "Run cancellation requested before tool execution",
+                    )
+                if current_run.intent.value == "pause":
+                    raise PauseRequested()
+
                 async def invoke(
                     tool: RegisteredTool = tool,
                     invocation: Invocation = invocation,
                 ) -> JsonObject:
+                    nonlocal execution_started
+                    execution_started = True
                     if tool.blocking_execute is not None:
                         return await self.blocking_tools.run(tool.blocking_execute, invocation)
                     assert tool.execute is not None
@@ -229,11 +255,17 @@ class ToolExecutor:
                 output = await self.scheduler.run(
                     resource, invoke, key=tool.spec.name, timeout=timeout
                 )
+                if self.ownership_check is not None:
+                    await self.ownership_check()
                 self.registry.validate(output, tool.spec.output_schema)
                 require(
                     len(output.text.encode("utf-8")) <= tool.spec.max_output_bytes,
                     "Tool output exceeds size limit",
                 )
+            except PauseRequested:
+                if invocation.status == InvocationStatus.EXECUTING:
+                    await self._change(invocation, InvocationStatus.READY)
+                raise
             except ResourceAdmissionError as caught:
                 await self._change(
                     invocation,
@@ -259,13 +291,22 @@ class ToolExecutor:
                     )
                 )
                 admission_cancelled = isinstance(caught, ResourceAdmissionCancelled)
-                uncertain = invocation.effect != Effect.READ_ONLY and not admission_cancelled
+                pre_execution_cancel = (
+                    isinstance(caught, HarnessError)
+                    and caught.code == ErrorCode.CANCELLATION
+                    and not execution_started
+                )
+                uncertain = (
+                    invocation.effect != Effect.READ_ONLY
+                    and execution_started
+                    and not admission_cancelled
+                )
                 await self._change(
                     invocation,
                     InvocationStatus.UNKNOWN
                     if uncertain
                     else InvocationStatus.CANCELLED
-                    if admission_cancelled
+                    if admission_cancelled or pre_execution_cancel
                     else InvocationStatus.FAILED,
                     error=error,
                 )

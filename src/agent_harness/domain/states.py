@@ -73,7 +73,7 @@ TASK_TRANSITIONS = MappingProxyType(
         ),
         T.WAITING_CHILDREN: frozenset({T.READY, T.PAUSED, T.BLOCKED, T.FAILED, T.CANCELLED}),
         T.WAITING_APPROVAL: frozenset({T.READY, T.PAUSED, T.FAILED, T.CANCELLED}),
-        T.PAUSED: frozenset({T.PENDING, T.FAILED, T.CANCELLED}),
+        T.PAUSED: frozenset({T.PENDING, T.READY, T.FAILED, T.CANCELLED}),
         T.SUCCEEDED: frozenset(),
         T.FAILED: frozenset(),
         T.CANCELLED: frozenset(),
@@ -98,7 +98,13 @@ INVOCATION_TRANSITIONS = MappingProxyType(
             {Invocation.EXECUTING, Invocation.FAILED, Invocation.CANCELLED}
         ),
         Invocation.EXECUTING: frozenset(
-            {Invocation.SUCCEEDED, Invocation.FAILED, Invocation.CANCELLED, Invocation.UNKNOWN}
+            {
+                Invocation.READY,
+                Invocation.SUCCEEDED,
+                Invocation.FAILED,
+                Invocation.CANCELLED,
+                Invocation.UNKNOWN,
+            }
         ),
         Invocation.SUCCEEDED: frozenset(),
         Invocation.FAILED: frozenset(),

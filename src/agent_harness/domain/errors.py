@@ -37,6 +37,10 @@ class HarnessError(Exception):
         self.diagnostic_reference = diagnostic_reference
 
 
+class PauseRequested(Exception):
+    """Internal control-flow signal; the owning run persists the paused checkpoint."""
+
+
 def require(condition: bool, message: str) -> None:
     if not condition:
         raise HarnessError(ErrorCode.VALIDATION, message)
