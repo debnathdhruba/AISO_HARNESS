@@ -9,9 +9,13 @@ from agent_harness.domain.model import RunOptions
 def select_mode(task: str, options: RunOptions) -> str:
     if options.required_tools:
         require(options.routing_mode != "chat", "Chat mode cannot satisfy required tools")
+        if options.provider == "ollama" and options.routing_mode == "auto":
+            return "router_worker"
         return "tools"
     if options.routing_mode != "auto":
         return options.routing_mode
+    if options.provider == "ollama":
+        return "router_worker"
     text = task.lower().strip()
     explicit = re.search(
         r"\b(calculator|artifact_(write|read|list)|(read|write|search|edit)_file|artifact demo)\b",

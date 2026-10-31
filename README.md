@@ -22,12 +22,19 @@ Type `exit` or `quit`, or press Ctrl+C, to stop the loop. You can also start it
 directly with `.\.venv\Scripts\python.exe -m agent_harness.interfaces.cli chat`;
 this defaults to `examples/ollama.toml` and user `local-user`.
 
-Ordinary questions now go straight to Gemma in one model call, capped at 512
-response tokens by default. Auto routing uses simple local rules and makes no
-extra model call. Arithmetic commands and file/artifact operations use LFM for
-tools followed by Gemma for the response. Override an ambiguous route with
-`--mode chat` or `--mode tools`. `--mode two_stage` retains the older draft flow.
-The resolved route is saved in the run; old runs keep their original behavior.
+Ollama `auto` mode uses a persisted Router-Worker pipeline. Gemma receives the
+full task context and decides whether to answer or select a tool. For a tool
+route, it sends only the selected tool and a compact JSON handoff to LFM; LFM
+receives that tool's schema and returns the native call. Gemma then sees the
+recorded tool results and routes again or gives the final answer. Router and
+worker model requests are separate durable trace steps. Answers are capped at
+512 tokens by default.
+
+Use `--mode router_worker` to force this pipeline, `--mode chat` to answer
+without tools, or `--mode tools` for the direct LFM tool flow. `--mode
+two_stage` retains the older draft flow. Offline fake-provider `auto` mode
+continues to use deterministic local routing. The resolved route is saved in
+the run; old runs keep their original behavior.
 
 The default tool set includes `read_file`, `write_file`, `search_files`, and
 `edit_file` in addition to calculator and artifact tools. File operations use

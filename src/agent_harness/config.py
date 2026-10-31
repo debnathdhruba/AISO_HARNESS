@@ -46,7 +46,7 @@ class Settings(BaseModel):
     workspace: str = "."
     artifact_root: str = ".local/artifacts"
     required_tools: tuple[str, ...] = ()
-    routing_mode: Literal["auto", "chat", "tools", "two_stage"] = "auto"
+    routing_mode: Literal["auto", "chat", "tools", "two_stage", "router_worker"] = "auto"
     response_max_tokens: int = Field(default=512, ge=1, le=8192)
     max_total_steps: int = Field(default=256, ge=1, le=4096)
     max_total_tokens: int = Field(default=262144, ge=1, le=10_000_000)

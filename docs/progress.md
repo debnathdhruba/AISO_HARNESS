@@ -4,10 +4,12 @@ Phases 3 through 8 are implemented and awaiting human review. See the
 [Phase 7 review](reviews/phase-07.md) and
 [Phase 8 review](reviews/phase-08.md) for recovery and memory details.
 
-Latest user-requested improvement: direct Gemma routing for ordinary questions,
-explicit mode overrides and a separate response-token limit. Verified with 87
-tests plus a live one-call run; both Ollama models were observed at 100% GPU on
-the RTX 3050. See [routing verification](reviews/routing-performance.md).
+Latest user-requested improvement: Ollama `auto` now uses the Gemma Router /
+LFM tool-Worker pipeline. Both model calls are persisted independently; the
+worker receives only the selected tool's compact handoff and schema. Static
+checks pass; the new pipeline has not yet been verified against live Ollama.
+The earlier direct-Gemma performance measurement is documented in
+[routing verification](reviews/routing-performance.md).
 
 | Phase | Scope | Status |
 | --- | --- | --- |

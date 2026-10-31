@@ -89,7 +89,9 @@ def run_command(
     timeout: Annotated[int | None, typer.Option(help="Total run deadline in seconds")] = None,
     require_write_approval: Annotated[bool | None, typer.Option()] = None,
     workspace: Annotated[str | None, typer.Option()] = None,
-    mode: Annotated[str | None, typer.Option(help="auto, chat, tools, or two_stage")] = None,
+    mode: Annotated[
+        str | None, typer.Option(help="auto, chat, tools, two_stage, or router_worker")
+    ] = None,
 ) -> None:
     settings = load_settings(
         config,

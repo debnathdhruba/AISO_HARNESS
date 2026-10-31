@@ -56,6 +56,7 @@ def decode_step(text: str) -> Step:
             tuple(decode_message(m) for m in request["messages"]),
             request["max_output_tokens"],
             tuple(tools),
+            request.get("json_mode", False),
         )
         response = data["response"]
         if response is not None:

@@ -56,6 +56,11 @@ The runner advances one bounded decision; the coordinator owns dependencies and
 child relationships. Task admission is round-robin across runs, FIFO within runs.
 Resource admission separately bounds queues and provider/tool capacity. Waiting
 parents release task slots. Cancellation intent is distinct from confirmed stop.
+For Ollama auto mode, `llm/router.py` implements a durable Router-Worker flow:
+Gemma routes using the full task context without native tool schemas, then LFM
+generates a single selected tool call from compact routed data and that tool's
+schema. Each model request remains an independent persisted step; tool policy,
+execution, and result validation stay in the existing runner and tool executor.
 Phase 4 implements in-process model, tool, artifact and memory admission lanes:
 queues reject excess work explicitly, model requests are capped per provider, and
 capacity snapshots expose active and queued counts. The blocking-tool adapter

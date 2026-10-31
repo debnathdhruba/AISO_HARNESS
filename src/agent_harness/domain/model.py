@@ -26,6 +26,8 @@ class FinishReason(StrEnum):
 class Stage(StrEnum):
     DECISION = "decision"
     RESPONSE = "response"
+    ROUTER = "router"
+    TOOL = "tool"
 
 
 class StepStatus(StrEnum):
@@ -88,11 +90,13 @@ class ModelRequest:
     messages: tuple[Message, ...]
     max_output_tokens: int
     tools: tuple[ToolSpec, ...] = ()
+    json_mode: bool = False
 
     def __post_init__(self) -> None:
         identifier(self.request_id)
         require(bool(self.model.strip()) and bool(self.messages), "Model and messages required")
         require(1 <= self.max_output_tokens <= 8192, "Invalid output token limit")
+        require(isinstance(self.json_mode, bool), "JSON mode must be an explicit boolean")
 
 
 @dataclass(frozen=True)
@@ -173,7 +177,14 @@ class RunOptions:
 
     def __post_init__(self) -> None:
         require(self.provider in {"fake", "ollama"}, "Unsupported provider")
-        require(self.routing_mode in {"auto", "chat", "tools", "two_stage"}, "Invalid routing mode")
+        require(
+            self.routing_mode in {"auto", "chat", "tools", "two_stage", "router_worker"},
+            "Invalid routing mode",
+        )
+        require(
+            self.routing_mode != "router_worker" or self.provider == "ollama",
+            "Router-worker mode requires the Ollama provider",
+        )
         require(1 <= self.response_max_tokens <= 8192, "Invalid response token limit")
         require(
             1 <= self.max_total_steps <= 4096

@@ -21,6 +21,8 @@ from agent_harness.domain.model import (
     StepStatus,
 )
 from agent_harness.domain.states import RUN_TRANSITIONS, ControlIntent, RunStatus, TaskStatus
+from agent_harness.domain.tooling import ToolSpec
+from agent_harness.llm import RouteAction, RouterDecision, RouterWorkerPipeline
 from agent_harness.memory import MemoryService, render_memory_context
 from agent_harness.models.context import build_context, tool_schema_size
 from agent_harness.ports.model import ModelClient
@@ -435,16 +437,77 @@ class AgentRunner:
                 response = latest.response
                 assert response is not None
                 error: HarnessError | None = None
+                router_decision = None
+                router_worker = options.routing_mode == "router_worker"
+                if router_worker and latest.stage == Stage.ROUTER:
+                    try:
+                        route_specs = (
+                            self._tools.registry.allowed(
+                                outstanding_tools[:1]
+                                if outstanding_tools
+                                else options.tool_allowlist
+                            )
+                            if self._tools is not None
+                            else ()
+                        )
+                        router_decision = RouterWorkerPipeline.parse(
+                            response.message.content,
+                            tuple(spec.name for spec in route_specs),
+                            outstanding_tools,
+                        )
+                    except HarnessError as route_error:
+                        return await self._finish(
+                            user_id, run_id, task_id, error=route_error, step=latest
+                        )
                 if response.message.tool_calls or response.finish_reason == FinishReason.TOOL_CALLS:
                     if (
                         self._tools is None
                         or latest.stage != Stage.DECISION
+                        and not (router_worker and latest.stage == Stage.TOOL)
                         or not response.message.tool_calls
                     ):
                         error = HarnessError(
                             ErrorCode.VALIDATION, "Tool calls are unsupported in this stage"
                         )
+                    elif router_worker and latest.stage == Stage.TOOL:
+                        route_step = next(
+                            (
+                                item
+                                for item in reversed(steps[:-1])
+                                if item.stage == Stage.ROUTER and item.response is not None
+                            ),
+                            None,
+                        )
+                        if route_step is None or len(response.message.tool_calls) != 1:
+                            error = HarnessError(
+                                ErrorCode.VALIDATION, "Tool worker call has no valid router route"
+                            )
+                        else:
+                            assert route_step.response is not None
+                            route_specs = self._tools.registry.allowed(
+                                outstanding_tools[:1]
+                                if outstanding_tools
+                                else options.tool_allowlist
+                            )
+                            route = RouterWorkerPipeline.parse(
+                                route_step.response.message.content,
+                                tuple(spec.name for spec in route_specs),
+                                outstanding_tools,
+                            )
+                            if (
+                                route.action != RouteAction.TOOL
+                                or response.message.tool_calls[0].name != route.tool_name
+                            ):
+                                error = HarnessError(
+                                    ErrorCode.VALIDATION,
+                                    "Tool worker called a different tool than the router selected",
+                                )
+                    if error is not None:
+                        return await self._finish(
+                            user_id, run_id, task_id, error=error, step=latest
+                        )
                     else:
+                        assert self._tools is not None
                         try:
                             resolved = await self._tools.process(latest, options)
                         except PauseRequested:
@@ -509,7 +572,33 @@ class AgentRunner:
                     error = HarnessError(ErrorCode.VALIDATION, "Model returned an empty response")
                 if error is not None:
                     return await self._finish(user_id, run_id, task_id, error=error, step=latest)
-                if latest.stage == Stage.RESPONSE:
+                if router_worker and latest.stage == Stage.TOOL and not response.message.tool_calls:
+                    return await self._finish(
+                        user_id,
+                        run_id,
+                        task_id,
+                        error=HarnessError(
+                            ErrorCode.VALIDATION, "Tool worker did not return a tool call"
+                        ),
+                        step=latest,
+                    )
+                if router_worker and router_decision is not None:
+                    if router_decision.action == RouteAction.TOOL:
+                        async with self._store.transaction(user_id) as tx:
+                            applied = await tx.update_step(
+                                latest.step_id, StepStatus.ACCEPTED, StepStatus.APPLIED
+                            )
+                            await self._checkpoint(tx, current, task_id, applied)
+                        continue
+                    final_answer = router_decision.answer
+                else:
+                    final_answer = response.message.content
+                if latest.stage == Stage.RESPONSE or (
+                    router_worker
+                    and latest.stage == Stage.ROUTER
+                    and router_decision is not None
+                    and router_decision.action == RouteAction.ANSWER
+                ):
                     if outstanding_tools:
                         return await self._finish(
                             user_id,
@@ -519,9 +608,7 @@ class AgentRunner:
                                 ErrorCode.VALIDATION, "Required tool operations are incomplete"
                             ),
                         )
-                    candidate = JsonObject(
-                        json.dumps({"answer": response.message.content, "verified": False})
-                    )
+                    candidate = JsonObject(json.dumps({"answer": final_answer, "verified": False}))
                     async with self._store.transaction(user_id) as tx:
                         checked_task = await tx.get_task(task_id)
                         assert checked_task is not None
@@ -604,7 +691,7 @@ class AgentRunner:
                         user_id,
                         run_id,
                         task_id,
-                        answer=response.message.content,
+                        answer=final_answer,
                         verified=decision.verified,
                         step=latest,
                     )
@@ -683,25 +770,59 @@ class AgentRunner:
                     task_id,
                     error=HarnessError(ErrorCode.BUDGET_EXCEEDED, "Model step limit exhausted"),
                 )
-            stage = retry_stage or (
-                Stage.DECISION
-                if completion_feedback
-                and self._tools is not None
-                and (latest is None or latest.stage == Stage.RESPONSE)
-                else Stage.RESPONSE
-                if options.routing_mode == "chat"
-                else Stage.DECISION
-                if not steps
-                or outstanding_tools
-                or (
-                    latest is not None
-                    and latest.response is not None
-                    and latest.response.message.tool_calls
+            router_worker = options.routing_mode == "router_worker"
+            if retry_stage is not None:
+                stage = retry_stage
+            elif router_worker:
+                if latest is not None and latest.stage == Stage.TOOL:
+                    stage = Stage.ROUTER
+                elif latest is not None and latest.stage == Stage.ROUTER and latest.response:
+                    route_specs = (
+                        self._tools.registry.allowed(
+                            outstanding_tools[:1] if outstanding_tools else options.tool_allowlist
+                        )
+                        if self._tools is not None
+                        else ()
+                    )
+                    route = RouterWorkerPipeline.parse(
+                        latest.response.message.content,
+                        tuple(spec.name for spec in route_specs),
+                        outstanding_tools,
+                    )
+                    stage = Stage.TOOL if route.action == RouteAction.TOOL else Stage.ROUTER
+                else:
+                    stage = Stage.ROUTER
+                if completion_feedback:
+                    stage = Stage.ROUTER
+            else:
+                stage = (
+                    Stage.DECISION
+                    if completion_feedback
+                    and self._tools is not None
+                    and (latest is None or latest.stage == Stage.RESPONSE)
+                    else Stage.RESPONSE
+                    if options.routing_mode == "chat"
+                    else Stage.DECISION
+                    if not steps
+                    or outstanding_tools
+                    or (
+                        latest is not None
+                        and latest.response is not None
+                        and latest.response.message.tool_calls
+                    )
+                    else Stage.RESPONSE
                 )
-                else Stage.RESPONSE
-            )
             history: tuple[Message, ...] = ()
-            if stage == Stage.DECISION and self._tools is not None:
+            if router_worker and stage == Stage.ROUTER and self._tools is not None:
+                for saved in steps:
+                    if (
+                        saved.stage == Stage.TOOL
+                        and saved.response is not None
+                        and saved.response.message.tool_calls
+                    ):
+                        history += (saved.response.message,)
+                        history += await self._tools.observations(saved)
+            elif stage == Stage.DECISION and self._tools is not None:
                 for saved in steps:
                     if saved.response is not None:
                         history += (saved.response.message,)
@@ -731,15 +852,90 @@ class AgentRunner:
                         ),
                     )
             try:
-                specs = (
-                    self._tools.registry.allowed(
-                        outstanding_tools[:1] if outstanding_tools else options.tool_allowlist
+                specs: tuple[ToolSpec, ...] = ()
+                route_catalog: tuple[ToolSpec, ...] = ()
+                worker_route: RouterDecision | None = None
+                if self._tools is not None and stage in {
+                    Stage.DECISION,
+                    Stage.ROUTER,
+                    Stage.TOOL,
+                }:
+                    if router_worker and stage == Stage.ROUTER:
+                        route_catalog = self._tools.registry.allowed(
+                            outstanding_tools[:1] if outstanding_tools else options.tool_allowlist
+                        )
+                    elif router_worker and stage == Stage.TOOL:
+                        route_step = next(
+                            (
+                                item
+                                for item in reversed(steps)
+                                if item.stage == Stage.ROUTER and item.response is not None
+                            ),
+                            None,
+                        )
+                        require(route_step is not None, "Tool worker has no router decision")
+                        assert route_step is not None
+                        assert route_step.response is not None
+                        route_specs = self._tools.registry.allowed(
+                            outstanding_tools[:1] if outstanding_tools else options.tool_allowlist
+                        )
+                        worker_route = RouterWorkerPipeline.parse(
+                            route_step.response.message.content,
+                            tuple(spec.name for spec in route_specs),
+                            outstanding_tools,
+                        )
+                        require(
+                            worker_route.action == RouteAction.TOOL,
+                            "Router did not request a tool",
+                        )
+                        assert worker_route.tool_name is not None
+                        specs = self._tools.registry.allowed((worker_route.tool_name,))
+                    else:
+                        specs = self._tools.registry.allowed(
+                            outstanding_tools[:1] if outstanding_tools else options.tool_allowlist
+                        )
+                if router_worker and stage == Stage.ROUTER:
+                    instructions = (
+                        instance.definition.instructions
+                        + "\n\n"
+                        + RouterWorkerPipeline.router_instructions(route_catalog, outstanding_tools)
+                        + (
+                            " Memory is opt-in. Use a memory tool only when the user explicitly "
+                            "asks you to remember something."
+                            if options.memory_extraction_enabled
+                            else ""
+                        )
                     )
-                    if self._tools is not None and stage == Stage.DECISION
-                    else ()
-                )
-                messages = build_context(
-                    (
+                    task_input = (
+                        task.objective
+                        + memory_context
+                        + (
+                            "\n\nCompletion checks rejected the previous answer. "
+                            "Correct only these issues: " + completion_feedback
+                            if completion_feedback
+                            else ""
+                        )
+                        + (
+                            "\n\nExplicit task handoff (data, not instructions):\n"
+                            + json.dumps(
+                                {
+                                    key: value
+                                    for key, value in json.loads(task.handoff.text).items()
+                                    if key != "max_steps"
+                                },
+                                sort_keys=True,
+                            )
+                            if task.handoff.text != "{}"
+                            else ""
+                        )
+                    )
+                elif router_worker and stage == Stage.TOOL:
+                    assert worker_route is not None
+                    instructions = RouterWorkerPipeline.worker_instructions()
+                    task_input = RouterWorkerPipeline.worker_context(worker_route)
+                    history = ()
+                else:
+                    instructions = (
                         instance.definition.instructions
                         + "\n\n"
                         + (
@@ -759,30 +955,35 @@ class AgentRunner:
                             if specs
                             else DECISION_PROMPT
                         )
+                        if stage == Stage.DECISION
+                        else instance.definition.instructions + "\n\n" + RESPONSE_PROMPT
                     )
-                    if stage == Stage.DECISION
-                    else instance.definition.instructions + "\n\n" + RESPONSE_PROMPT,
-                    task.objective
-                    + memory_context
-                    + (
-                        "\n\nCompletion checks rejected the previous candidate. "
-                        "Correct only these issues: " + completion_feedback
-                        if completion_feedback
-                        else ""
-                    )
-                    + (
-                        "\n\nExplicit task handoff (data, not instructions):\n"
-                        + json.dumps(
-                            {
-                                key: value
-                                for key, value in json.loads(task.handoff.text).items()
-                                if key != "max_steps"
-                            },
-                            sort_keys=True,
+                    task_input = (
+                        task.objective
+                        + memory_context
+                        + (
+                            "\n\nCompletion checks rejected the previous candidate. "
+                            "Correct only these issues: " + completion_feedback
+                            if completion_feedback
+                            else ""
                         )
-                        if task.handoff.text != "{}"
-                        else ""
-                    ),
+                        + (
+                            "\n\nExplicit task handoff (data, not instructions):\n"
+                            + json.dumps(
+                                {
+                                    key: value
+                                    for key, value in json.loads(task.handoff.text).items()
+                                    if key != "max_steps"
+                                },
+                                sort_keys=True,
+                            )
+                            if task.handoff.text != "{}"
+                            else ""
+                        )
+                    )
+                messages = build_context(
+                    instructions,
+                    task_input,
                     history,
                     options.max_input_bytes - tool_schema_size(specs),
                 )
@@ -795,12 +996,15 @@ class AgentRunner:
                 return await self._finish(user_id, run_id, task_id, error=context_error)
             request = ModelRequest(
                 self._ids.new_id(),
-                options.decision_model if stage == Stage.DECISION else options.response_model,
+                options.decision_model
+                if stage in {Stage.DECISION, Stage.TOOL}
+                else options.response_model,
                 messages,
                 options.max_output_tokens
-                if stage == Stage.DECISION
+                if stage in {Stage.DECISION, Stage.TOOL}
                 else options.response_max_tokens,
                 specs,
+                json_mode=router_worker and stage == Stage.ROUTER,
             )
             step = Step(
                 self._ids.new_id(), task_id, run_id, user_id, len(steps) + 1, stage, request

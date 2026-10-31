@@ -181,6 +181,7 @@ class OllamaClient:
         raw = await self._post(
             "/api/chat",
             {
+                **({"format": "json"} if request.json_mode else {}),
                 "model": request.model,
                 "messages": messages,
                 **extra,
