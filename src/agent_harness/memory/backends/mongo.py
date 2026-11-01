@@ -638,22 +638,40 @@ class MongoStore:
             document = model.document
             keys = tuple(document["key"].items())
             options = {
-                key: value for key, value in document.items() if key not in {"key", "name"}
+                key: value
+                for key, value in document.items()
+                if key not in {"key", "name", "partialFilterExpression"}
             }
             collection_indexes = indexes.setdefault(collection, [])
-            for existing in collection_indexes:
+            for position, existing in enumerate(collection_indexes):
                 existing_document = existing.document
                 if tuple(existing_document["key"].items()) != keys:
                     continue
                 existing_options = {
                     key: value
                     for key, value in existing_document.items()
-                    if key not in {"key", "name"}
+                    if key not in {"key", "name", "partialFilterExpression"}
                 }
                 require(
                     existing_options == options,
                     f"Conflicting index options for {collection} {keys}",
                 )
+                existing_filter = existing_document.get("partialFilterExpression", {})
+                new_filter = document.get("partialFilterExpression", {})
+                existing_kinds = existing_filter.get("_kind")
+                new_kinds = new_filter.get("_kind")
+                require(
+                    isinstance(existing_kinds, str) and isinstance(new_kinds, str),
+                    f"Conflicting index filters for {collection} {keys}",
+                )
+                kinds = sorted({existing_kinds, new_kinds})
+                merged_options = dict(options)
+                merged_options["partialFilterExpression"] = {
+                    "_kind": kinds[0] if len(kinds) == 1 else {"$in": kinds}
+                }
+                if "name" in existing_document:
+                    merged_options["name"] = existing_document["name"]
+                collection_indexes[position] = IndexModel(list(keys), **merged_options)
                 return
             collection_indexes.append(model)
 
@@ -664,6 +682,7 @@ class MongoStore:
                 IndexModel(
                     [("_kind", ASCENDING), *keys],
                     unique=collection_name in unique_compound,
+                    partialFilterExpression={"_kind": collection_name},
                 ),
             )
         for collection_name, field in (
@@ -678,7 +697,11 @@ class MongoStore:
             physical = COLLECTION_BUCKETS.get(collection_name, "telemetry")
             add_index(
                 physical,
-                IndexModel([("_kind", ASCENDING), (field, ASCENDING)], unique=True)
+                IndexModel(
+                    [("_kind", ASCENDING), (field, ASCENDING)],
+                    unique=True,
+                    partialFilterExpression={"_kind": collection_name},
+                ),
             )
         for collection_name, field in (
             ("delegations", "child_task_id"),
@@ -688,7 +711,11 @@ class MongoStore:
             physical = COLLECTION_BUCKETS.get(collection_name, "telemetry")
             add_index(
                 physical,
-                IndexModel([("_kind", ASCENDING), (field, ASCENDING)], unique=True)
+                IndexModel(
+                    [("_kind", ASCENDING), (field, ASCENDING)],
+                    unique=True,
+                    partialFilterExpression={"_kind": collection_name},
+                ),
             )
         add_index(
             "telemetry",
@@ -700,8 +727,28 @@ class MongoStore:
                     ("task_id", ASCENDING),
                 ],
                 name="telemetry_invocations_user_run_task",
+                partialFilterExpression={"_kind": "invocations"},
             ),
         )
+        existing_collections = set(await self._database.list_collection_names())
+        for collection_name, collection_indexes in indexes.items():
+            if collection_name not in existing_collections:
+                continue
+            desired_indexes = {
+                tuple(model.document["key"].items()): model.document
+                for model in collection_indexes
+            }
+            existing = await self._database[collection_name].list_indexes()
+            async for current in existing:
+                keys = tuple(current["key"].items())
+                desired = desired_indexes.get(keys)
+                if (
+                    desired is not None
+                    and current.get("name") == desired.get("name")
+                    and current.get("partialFilterExpression")
+                    != desired.get("partialFilterExpression")
+                ):
+                    await self._database[collection_name].drop_index(current["name"])
         await asyncio.gather(
             *(
                 self._database[collection_name].create_indexes(collection_indexes)

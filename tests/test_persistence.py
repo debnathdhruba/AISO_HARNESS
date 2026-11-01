@@ -30,6 +30,9 @@ async def test_mongo_index_setup_deduplicates_shared_logical_indexes() -> None:
         def __init__(self) -> None:
             self.collections = {}
 
+        async def list_collection_names(self) -> list[str]:
+            return []
+
         def __getitem__(self, name: str) -> Collection:
             return self.collections.setdefault(name, Collection())
 
@@ -44,6 +47,11 @@ async def test_mongo_index_setup_deduplicates_shared_logical_indexes() -> None:
             for index in telemetry_indexes
         ]
         assert len(signatures) == len(set(signatures))
+        assert all(
+            index.document.get("partialFilterExpression")
+            for index in telemetry_indexes
+            if index.document.get("unique") is True
+        )
     finally:
         await store._client.close()
 
