@@ -24,17 +24,15 @@ from agent_harness.domain.states import (
     TaskStatus,
     validate_transition,
 )
-from agent_harness.domain.tooling import Approval, ArtifactRecord, Invocation
-from agent_harness.models.codec import decode_step, encode_step
-from agent_harness.persistence.codec import decode_run, decode_task, encode
-from agent_harness.persistence.migrations import migrate
-from agent_harness.persistence.tool_codec import (
-    decode_artifact,
+from agent_harness.domain.tooling import Approval, Invocation
+from agent_harness.memory.backends.codec import decode_run, decode_task, encode
+from agent_harness.memory.backends.migrations import migrate
+from agent_harness.memory.backends.tool_codec import (
     decode_invocation,
-    encode_artifact,
     encode_invocation,
 )
-from agent_harness.ports.state import Clock, IdGenerator, StateTransaction
+from agent_harness.models.codec import decode_step, encode_step
+from agent_harness.protocols.state import Clock, IdGenerator, StateTransaction
 
 
 @dataclass
@@ -350,55 +348,6 @@ class SQLiteTransaction:
             ),
             InvocationStatus.AWAITING_APPROVAL,
         )
-
-    async def artifacts(self, run_id: str) -> tuple[ArtifactRecord, ...]:
-        self.check_active()
-        async with self._db.execute(
-            "SELECT snapshot FROM artifacts WHERE run_id=? AND user_id=? ORDER BY name,version",
-            (run_id, self._user),
-        ) as cursor:
-            return tuple(decode_artifact(str(row[0])) for row in await cursor.fetchall())
-
-    @mutation
-    async def save_artifact(self, artifact: ArtifactRecord, expected: str | None) -> None:
-        self._scope(artifact.user_id)
-        previous = next(
-            (
-                a
-                for a in await self.artifacts(artifact.run_id)
-                if a.artifact_id == artifact.artifact_id
-            ),
-            None,
-        )
-        if (previous.status if previous else None) != expected:
-            raise conflict()
-        if previous is None:
-            require(artifact.status == "staged", "New manifest must be staged")
-            await self._db.execute(
-                "INSERT INTO artifacts VALUES (?,?,?,?,?,?,?,?)",
-                (
-                    artifact.artifact_id,
-                    artifact.run_id,
-                    artifact.task_id,
-                    artifact.user_id,
-                    artifact.name,
-                    artifact.version,
-                    artifact.status,
-                    encode_artifact(artifact),
-                ),
-            )
-        else:
-            require(
-                previous.status == "staged"
-                and artifact.status == "committed"
-                and replace(previous, status="committed") == artifact,
-                "Invalid manifest transition",
-            )
-            await self._db.execute(
-                "UPDATE artifacts SET status=?,snapshot=? WHERE artifact_id=?",
-                (artifact.status, encode_artifact(artifact), artifact.artifact_id),
-            )
-        await self._event(artifact.run_id, f"artifact.{artifact.status}", task_id=artifact.task_id)
 
     @mutation
     async def create_step(self, step: Step) -> None:
@@ -887,7 +836,11 @@ class SQLiteTransaction:
             raise HarnessError(ErrorCode.AUTHORIZATION, "Task is unavailable to this principal")
         if task.version != expected_version:
             raise conflict()
-        require(task.status == TaskStatus.READY, "Handoff can only be finalized before execution")
+        started = await self.steps(task.run_id, task_id)
+        require(
+            task.status == TaskStatus.READY or (task.status == TaskStatus.RUNNING and not started),
+            "Handoff can only be finalized before model execution",
+        )
         updated = replace(
             task,
             handoff=handoff,

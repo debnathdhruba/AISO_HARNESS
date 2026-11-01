@@ -10,9 +10,9 @@ from conftest import FixedClock, SequenceIds
 from agent_harness.domain.entities import Checkpoint, JsonObject, Run, Task
 from agent_harness.domain.errors import ErrorCode, HarnessError
 from agent_harness.domain.states import ControlIntent, RunStatus, TaskStatus
-from agent_harness.persistence.codec import encode
-from agent_harness.persistence.migrations import MIGRATIONS
-from agent_harness.persistence.sqlite import SQLiteStore
+from agent_harness.memory.backends.codec import encode
+from agent_harness.memory.backends.migrations import MIGRATIONS
+from agent_harness.memory.backends.sqlite import SQLiteStore
 
 pytestmark = pytest.mark.asyncio
 

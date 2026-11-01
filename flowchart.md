@@ -30,13 +30,13 @@ flowchart TD
     TOOL_EXEC --> LIMITS
     MEMORY --> LIMITS
     LIMITS --> OLLAMA[OllamaClient]
-    LIMITS --> LOCAL_TOOLS[Workspace + artifact tools]
+    LIMITS --> LOCAL_TOOLS[Local filesystem tools]
 
     RUNNER --> STORE
     CHILD_RUNNER --> STORE
     TOOL_EXEC --> STORE
     MEMORY --> STORE
-    STORE --> DATA[Runs, tasks, steps, invocations, events,<br/>checkpoints, budgets, artifacts, memory]
+    STORE --> DATA[Runs, tasks, steps, invocations, events,<br/>checkpoints, budgets, memory]
     RUNNER --> RESULT[Validated run result]
     RESULT --> CLI
     CLI --> USER_OUT[Stream final answer + status]
@@ -88,10 +88,10 @@ flowchart TD
     DEP -->|Yes| PARALLEL[TaskScheduler runs eligible children<br/>within per-run and global limits]
     DEP -->|No| BLOCKED[Wait for prerequisite child]
     BLOCKED --> DEP
-    PARALLEL --> JOIN[Collect child outcomes and artifacts]
+    PARALLEL --> JOIN[Collect child outcomes]
     JOIN --> STEP
 
-    ACTION -->|Final answer| CHECK[Validate required tools, children,<br/>artifacts, and result schema]
+    ACTION -->|Final answer| CHECK[Validate required tools, children,<br/>and result schema]
     CHECK -->|Correction allowed| STEP
     CHECK -->|Passed| FINISH[Persist completed/partial result]
     CHECK -->|Failed or exhausted| FAIL[Persist failure]
@@ -168,7 +168,7 @@ flowchart LR
     QUEUE --> F[AgentFactory creates task-scoped worker]
     F --> RUN[AgentRunner executes child]
     RUN --> RG[Shared model/tool resource limits]
-    RG --> CHILD_RESULT[Persist child result, failure,<br/>and artifacts]
+    RG --> CHILD_RESULT[Persist child result or failure]
     CHILD_RESULT --> COMPLETE{All required children settled?}
     COMPLETE -->|No| QUEUE
     COMPLETE -->|Yes| COLLECT[Coordinator collects structured outcomes]

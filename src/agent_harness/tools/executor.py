@@ -13,7 +13,8 @@ from agent_harness.domain.errors import ErrorCode, HarnessError, PauseRequested,
 from agent_harness.domain.model import Message, Role, RunOptions, Step
 from agent_harness.domain.states import InvocationStatus
 from agent_harness.domain.tooling import Approval, Effect, Invocation, argument_hash
-from agent_harness.ports.state import Clock, StateStore
+from agent_harness.logger import audit
+from agent_harness.protocols.state import Clock, StateStore
 from agent_harness.scheduling import (
     BlockingToolAdapter,
     ResourceAdmissionCancelled,
@@ -22,9 +23,6 @@ from agent_harness.scheduling import (
     ResourceScheduler,
 )
 from agent_harness.tools.registry import RegisteredTool, ToolRegistry
-
-ARTIFACT_TOOLS = frozenset({"read_file", "write_file", "search_files", "edit_file"})
-
 
 def error_payload(error: HarnessError) -> JsonObject:
     return JsonObject(json.dumps({"code": error.code.value, "message": error.message}))
@@ -125,6 +123,15 @@ class ToolExecutor:
                     )
                 await tx.save_invocation(updated, InvocationStatus.PLANNED)
                 records.append(updated)
+                audit(
+                    "tool.invocation.planned",
+                    run_id=step.run_id,
+                    task_id=step.task_id,
+                    invocation_id=invocation.invocation_id,
+                    tool=invocation.tool_name,
+                    status=updated.status.value,
+                    approval_required=needs_approval,
+                )
         return tuple(records)
 
     async def process(self, step: Step, options: RunOptions) -> bool:
@@ -220,6 +227,13 @@ class ToolExecutor:
                     BudgetUsage(steps=0, tokens=0, tool_calls=1),
                 )
             invocation = await self._change(invocation, InvocationStatus.EXECUTING)
+            audit(
+                "tool.execution_started",
+                run_id=step.run_id,
+                task_id=step.task_id,
+                invocation_id=invocation.invocation_id,
+                tool=invocation.tool_name,
+            )
             execution_started = False
             try:
                 if self.ownership_check is not None:
@@ -246,14 +260,9 @@ class ToolExecutor:
                     assert tool.execute is not None
                     return await tool.execute(invocation)
 
-                resource = (
-                    ResourceKind.ARTIFACT
-                    if tool.spec.name.startswith("artifact_") or tool.spec.name in ARTIFACT_TOOLS
-                    else ResourceKind.TOOL
-                )
                 timeout = min(remaining, tool.spec.timeout_seconds)
                 output = await self.scheduler.run(
-                    resource, invoke, key=tool.spec.name, timeout=timeout
+                    ResourceKind.TOOL, invoke, key=tool.spec.name, timeout=timeout
                 )
                 if self.ownership_check is not None:
                     await self.ownership_check()
@@ -319,6 +328,14 @@ class ToolExecutor:
                     ) from None
                 continue
             await self._change(invocation, InvocationStatus.SUCCEEDED, result=output)
+            audit(
+                "tool.execution_succeeded",
+                run_id=step.run_id,
+                task_id=step.task_id,
+                invocation_id=invocation.invocation_id,
+                tool=invocation.tool_name,
+                output_bytes=len(output.text.encode("utf-8")),
+            )
         return True
 
     async def observations(self, step: Step) -> tuple[Message, ...]:

@@ -15,6 +15,7 @@ dependencies = [
     "python-dotenv>=1,<2",
     "typer",
     "jsonschema",
+    "laya>=0.4.20",
 ]
 
 [project.scripts]

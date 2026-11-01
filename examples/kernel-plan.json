@@ -1,0 +1,18 @@
+{
+  "plan_id": "document_review",
+  "version": 1,
+  "tasks": [
+    {
+      "alias": "inspect",
+      "objective": "Extract the key facts from the assigned page.",
+      "input_pages": ["page-1"],
+      "capabilities": []
+    },
+    {
+      "alias": "summarize",
+      "objective": "Produce a concise summary of the inspected facts.",
+      "depends_on": ["inspect"],
+      "capabilities": []
+    }
+  ]
+}

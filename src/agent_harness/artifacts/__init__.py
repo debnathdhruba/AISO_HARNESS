@@ -1,1 +1,0 @@
-"""Workspace-scoped artifact storage."""

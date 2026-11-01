@@ -1,4 +1,4 @@
-"""Durable tool identities, exact schemas, approvals and artifact manifests."""
+"""Durable tool identities, exact schemas, and approvals."""
 
 from dataclasses import dataclass
 from datetime import datetime
@@ -78,27 +78,3 @@ class Approval:
     argument_hash: str
     approved: bool
     expires_at: datetime
-
-
-@dataclass(frozen=True)
-class ArtifactRecord:
-    artifact_id: str
-    run_id: str
-    task_id: str
-    user_id: str
-    invocation_id: str
-    name: str
-    relative_path: str
-    version: int
-    checksum: str
-    size: int
-    status: str = "staged"
-    media_type: str = "text/plain; charset=utf-8"
-
-    def __post_init__(self) -> None:
-        for value in (self.artifact_id, self.run_id, self.task_id, self.invocation_id):
-            identifier(value)
-        require(
-            self.status in {"staged", "committed"} and self.version > 0 and self.size >= 0,
-            "Invalid artifact manifest",
-        )

@@ -12,7 +12,7 @@ from agent_harness.domain.entities import JsonObject, Task
 from agent_harness.domain.errors import ErrorCode, HarnessError, PauseRequested, require
 from agent_harness.domain.model import RunOptions
 from agent_harness.domain.states import TaskStatus
-from agent_harness.ports.state import Clock, IdGenerator, StateStore
+from agent_harness.protocols.state import Clock, IdGenerator, StateStore
 
 
 @dataclass(frozen=True)
@@ -23,10 +23,11 @@ class DelegatedTask:
     agent_version: str
     objective: str
     acceptance_criteria: JsonObject
-    input_artifact_ids: tuple[str, ...] = ()
     dependencies: tuple[str, ...] = ()
     capabilities: tuple[str, ...] = ()
     max_steps: int | None = None
+    handoff: JsonObject = JsonObject()
+    enforce_capabilities: bool = False
 
     def __post_init__(self) -> None:
         require(
@@ -51,7 +52,6 @@ class DelegatedTask:
             and len(set(self.capabilities)) == len(self.capabilities),
             "Delegation contains duplicate references",
         )
-        require(len(self.input_artifact_ids) <= 16, "Too many input artifacts")
         require(
             self.max_steps is None or 1 <= self.max_steps <= 100,
             "Requested child step limit must be 1..100",
@@ -148,7 +148,7 @@ class TaskCoordinator:
                 )
                 requested_capabilities = (
                     set(spec.capabilities)
-                    if spec.capabilities
+                    if spec.enforce_capabilities or spec.capabilities
                     else set(child_definition.capabilities) & set(parent_instance.capabilities)
                 )
                 require(
@@ -162,15 +162,6 @@ class TaskCoordinator:
                     "Child step limit cannot exceed the parent limit",
                 )
                 dependencies = tuple(task_ids[value] for value in spec.dependencies)
-                existing_artifacts = {
-                    item.artifact_id
-                    for item in await tx.artifacts(parent.run_id)
-                    if item.status == "committed"
-                }
-                require(
-                    set(spec.input_artifact_ids) <= existing_artifacts,
-                    "Delegation references an unavailable artifact",
-                )
                 child_id = task_ids[spec.alias]
                 task = Task(
                     child_id,
@@ -193,7 +184,7 @@ class TaskCoordinator:
                         json.dumps(
                             {
                                 "max_steps": requested_steps,
-                                "input_artifact_ids": list(spec.input_artifact_ids),
+                                **json.loads(spec.handoff.text),
                             }
                         )
                     ),
@@ -267,17 +258,6 @@ class TaskCoordinator:
                         dependency_results: list[dict[str, Any]] = []
                         for dependency_id in current.dependencies:
                             dependency = refreshed[dependency_id]
-                            dependency_artifacts: list[dict[str, Any]] = [
-                                {
-                                    "artifact_id": artifact.artifact_id,
-                                    "name": artifact.name,
-                                    "version": artifact.version,
-                                    "checksum": artifact.checksum,
-                                }
-                                for artifact in await tx.artifacts(dependency.run_id)
-                                if artifact.task_id == dependency.task_id
-                                and artifact.status == "committed"
-                            ]
                             dependency_results.append(
                                 {
                                     "task_id": dependency.task_id,
@@ -288,24 +268,14 @@ class TaskCoordinator:
                                     "error": json.loads(dependency.error.text)
                                     if dependency.error
                                     else None,
-                                    "artifacts": dependency_artifacts,
                                 }
                             )
                         handoff: dict[str, Any] = json.loads(current.handoff.text)
+                        kernel = handoff.get("kernel", {})
+                        require(isinstance(kernel, dict), "Task kernel handoff must be an object")
+                        if kernel.get("managed_dependencies") is True:
+                            continue
                         handoff["dependency_results"] = dependency_results
-                        raw_input_ids = handoff.get("input_artifact_ids", [])
-                        require(
-                            isinstance(raw_input_ids, list)
-                            and all(isinstance(item, str) for item in raw_input_ids),
-                            "Task handoff input_artifact_ids must be a list of strings",
-                        )
-                        input_ids = set(raw_input_ids)
-                        input_ids.update(
-                            artifact["artifact_id"]
-                            for dependency in dependency_results
-                            for artifact in dependency["artifacts"]
-                        )
-                        handoff["input_artifact_ids"] = sorted(input_ids)
                         current = await tx.set_task_handoff(
                             current.task_id,
                             current.version,
@@ -411,16 +381,6 @@ class TaskCoordinator:
                 task_id = task_ids[alias]
                 task = await tx.get_task(task_id)
                 assert task is not None
-                artifacts = [
-                    {
-                        "artifact_id": artifact.artifact_id,
-                        "name": artifact.name,
-                        "version": artifact.version,
-                        "checksum": artifact.checksum,
-                    }
-                    for artifact in await tx.artifacts(task.run_id)
-                    if artifact.task_id == task.task_id and artifact.status == "committed"
-                ]
                 results.append(
                     {
                         "alias": alias,
@@ -428,7 +388,6 @@ class TaskCoordinator:
                         "status": task.status.value,
                         "result": json.loads(task.result.text) if task.result else None,
                         "error": json.loads(task.error.text) if task.error else None,
-                        "artifacts": artifacts,
                     }
                 )
             return JsonObject(json.dumps({"children": results}))

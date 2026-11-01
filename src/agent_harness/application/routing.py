@@ -42,12 +42,10 @@ def select_mode(task: str, options: RunOptions) -> str:
         return "tools"
     if options.routing_mode != "auto":
         return options.routing_mode
-    if options.provider == "ollama":
-        return "tools"
     text = task.lower().strip()
     explicit = re.search(
-        r"\b(calculator|artifact_(write|read|list)|list_files|read_file_range|"
-        r"(read|write|search|edit)_file|artifact demo)\b",
+        r"\b(calculator|list_files|read_file_range|"
+        r"(read|write|search|edit)_file)\b",
         text,
     )
     command = re.sub(r"^(please\s+|(?:can|could|would) you\s+)", "", text)
@@ -55,7 +53,7 @@ def select_mode(task: str, options: RunOptions) -> str:
     filesystem = re.search(
         r"\b(write|save|read|list|create|edit|search|find|replace)\b", command
     ) and re.search(
-        r"\b(artifact|file|files|workspace)\b|\.(txt|md|json|csv|py|toml|yaml|yml)\b",
+        r"\b(file|files|workspace)\b|\.(txt|md|json|csv|py|toml|yaml|yml)\b",
         command,
     )
     return "tools" if explicit or arithmetic or filesystem else "chat"

@@ -9,9 +9,6 @@ max_output_tokens = -1
 max_input_bytes = 16384
 tool_allowlist = [
     "calculator",
-    "artifact_write",
-    "artifact_read",
-    "artifact_list",
     "list_files",
     "read_file",
     "read_file_range",
@@ -20,7 +17,7 @@ tool_allowlist = [
     "edit_file",
     "delegate_tasks",
 ]
-required_tools = ["calculator", "artifact_write", "artifact_read"]
+required_tools = ["calculator", "write_file", "read_file"]
 routing_mode = "tools"
 response_max_tokens = -1
 model_concurrency = 2
@@ -28,8 +25,6 @@ model_queue_capacity = 8
 model_provider_concurrency = 2
 tool_concurrency = 4
 tool_queue_capacity = 16
-artifact_concurrency = 2
-artifact_queue_capacity = 8
 memory_concurrency = 2
 memory_queue_capacity = 8
 blocking_tool_workers = 2

@@ -26,10 +26,10 @@ from agent_harness.domain.model import (
 )
 from agent_harness.domain.states import RunStatus
 from agent_harness.interfaces.cli import app
+from agent_harness.memory.backends.sqlite import SQLiteStore
 from agent_harness.models.context import build_context, size
 from agent_harness.models.gateway import ModelGateway
-from agent_harness.persistence.sqlite import SQLiteStore
-from agent_harness.ports.state import StateTransaction
+from agent_harness.protocols.state import StateTransaction
 
 
 def answer(text: str = "Final answer") -> ModelResponse:

@@ -50,7 +50,6 @@ class RunConfig:
     policy: JsonObject = field(default_factory=JsonObject)
     budgets: JsonObject = field(default_factory=JsonObject)
     memory: JsonObject = field(default_factory=JsonObject)
-    workspace: JsonObject = field(default_factory=JsonObject)
 
     def __post_init__(self) -> None:
         require(

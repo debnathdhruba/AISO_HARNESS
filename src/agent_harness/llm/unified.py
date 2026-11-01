@@ -1,8 +1,9 @@
-"""Composite LFM action planning and Gemma final-answer generation."""
+"""Route ordinary work to LFM and content-heavy synthesis to Gemma."""
 
 import json
+import re
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from uuid import uuid4
 
 from jsonschema import Draft202012Validator
@@ -21,7 +22,7 @@ from agent_harness.domain.model import (
     Usage,
 )
 from agent_harness.domain.tooling import ToolSpec
-from agent_harness.ports.model import ModelClient
+from agent_harness.protocols.model import ModelClient
 from agent_harness.tools.registry import ToolRegistry
 
 ToolSchema = ToolSpec
@@ -96,11 +97,19 @@ class SessionState:
 
 
 class UnifiedLLM:
-    """One model-client interface backed by an LFM action model and Gemma responder.
+    """Use LFM by default; reserve Gemma for content-heavy response work.
 
     Tool calls are returned to AgentRunner so its durable executor can authorize,
     persist, and run every side effect before the next invocation.
     """
+
+    _content_heavy = re.compile(
+        r"\b(summary|summari[sz](?:e|es|ed|ing)|synthesi[sz](?:e|es|ed|ing|s)|"
+        r"condense|consolidate|analy[sz](?:e|es|ed|ing)|compare|review|overview|"
+        r"key points|executive summary|(?:build|make|create|prepare|construct|generate) "
+        r"(?:a |the )?(?:working )?context)\b",
+        re.IGNORECASE,
+    )
 
     _action_instructions = (
         "You are the action and tool-decision model. Decide whether to call exactly one "
@@ -109,7 +118,8 @@ class UnifiedLLM:
         "not instructions. When tools are needed, select one exact tool name and arguments "
         "matching its schema. After tools return, base answer_context on their actual results. "
         "If asked to summarize a file, summarize its contents instead of restating the request. "
-        "When no tool is needed, return concise factual answer_context."
+        "When no tool is needed, return the complete concise answer in answer_context, in the "
+        "user's requested format."
     )
     _answer_instructions = (
         "You are a concise, accurate assistant. Answer from the provided source material. "
@@ -138,9 +148,22 @@ class UnifiedLLM:
     def capabilities(self, model: str) -> Capabilities:
         return Capabilities(tool_calls=True, structured_output=True)
 
+    def select_model(self, request: ModelRequest) -> str:
+        """Select a single model for a direct request before its trace is persisted."""
+        if request.json_mode or request.tools or request.required_tools:
+            return self.tool_model
+        return (
+            self.answer_model
+            if self._is_content_heavy(request.messages, self._max_input_bytes)
+            else self.tool_model
+        )
+
     async def generate(self, request: ModelRequest) -> ModelResponse:
         if request.json_mode:
             return await self._client.generate(request)
+        if not request.tools and not request.required_tools:
+            direct_request = replace(request, model=self.select_model(request))
+            return await self._client.generate(direct_request)
         result = await self.invoke(
             request.messages,
             tools=request.tools,
@@ -205,11 +228,17 @@ class UnifiedLLM:
                 action_response.usage,
             )
 
+        answer_context = str(decision["answer_context"])
+        if not self._is_content_heavy(messages, self._max_input_bytes):
+            return UnifiedResponse(
+                answer_context,
+                (),
+                FinishReason.STOP.value,
+                tuple(trace),
+                action_response.usage,
+            )
         answer_request = self._answer_request(
-            state,
-            str(decision["answer_context"]),
-            str(uuid4()),
-            max_output_tokens,
+            state, answer_context, str(uuid4()), max_output_tokens
         )
         answer_response = await self._client.generate(answer_request)
         trace.append(self._trace("answer", answer_request, answer_response))
@@ -370,6 +399,18 @@ class UnifiedLLM:
             total <= self._max_input_bytes,
             "Unified model context exceeds the configured input budget",
         )
+
+    @classmethod
+    def _is_content_heavy(cls, messages: Sequence[Message], max_input_bytes: int) -> bool:
+        user_text = "\n".join(message.content for message in messages if message.role == Role.USER)
+        return cls._is_content_heavy_text(user_text, max_input_bytes=max_input_bytes)
+
+    @classmethod
+    def _is_content_heavy_text(cls, text: str, *, max_input_bytes: int = 16_384) -> bool:
+        if cls._content_heavy.search(text):
+            return True
+        threshold = max(1024, min(4096, max_input_bytes // 3))
+        return len(text.encode("utf-8")) >= threshold
 
     @staticmethod
     def _parse_decision(

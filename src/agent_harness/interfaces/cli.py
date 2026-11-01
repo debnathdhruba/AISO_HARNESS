@@ -7,10 +7,14 @@ from typing import Annotated
 
 import typer
 
+from agent_harness.agent_orchestration_core import (
+    ContextPager,
+    PlanCompiler,
+)
 from agent_harness.bootstrap import application, runner
 from agent_harness.config import Settings, load_settings
-from agent_harness.domain.entities import Event, JsonObject, Run
-from agent_harness.domain.errors import HarnessError
+from agent_harness.domain.entities import Event, JsonObject, Run, Task
+from agent_harness.domain.errors import ErrorCode, HarnessError
 from agent_harness.domain.memory import MemoryRecord, MemorySharing
 from agent_harness.domain.model import RunOptions
 from agent_harness.domain.states import ControlIntent, RunStatus
@@ -93,7 +97,6 @@ def run_command(
     max_steps: Annotated[int | None, typer.Option()] = None,
     timeout: Annotated[int | None, typer.Option(help="Total run deadline in seconds")] = None,
     require_write_approval: Annotated[bool | None, typer.Option()] = None,
-    workspace: Annotated[str | None, typer.Option()] = None,
     mode: Annotated[
         str | None, typer.Option(help="auto, chat, tools, two_stage, or router_worker")
     ] = None,
@@ -105,12 +108,71 @@ def run_command(
         max_steps=max_steps,
         timeout_seconds=timeout,
         require_write_approval=require_write_approval,
-        workspace=workspace,
         routing_mode=mode,
     )
     result = asyncio.run(execute(settings, user, task, None))
     typer.echo(json.dumps(summary(result), indent=2))
     if result.status != RunStatus.COMPLETED:
+        raise typer.Exit(1)
+
+
+@app.command("kernel-run")
+def kernel_run_command(
+    task: Annotated[str, typer.Option(help="User objective for the final reducer")],
+    plan: Annotated[Path, typer.Option(exists=True, readable=True, help="Strict JSON DAG plan")],
+    payload: Annotated[
+        Path, typer.Option(exists=True, readable=True, help="UTF-8 payload paged for workers")
+    ],
+    user: Annotated[str, typer.Option(help="Trusted-local principal")],
+    config: Annotated[Path | None, typer.Option(help="TOML settings path")] = None,
+) -> None:
+    """Execute a prevalidated subagent DAG; agents never issue scheduling syscalls."""
+
+    async def execute_kernel() -> Run:
+        settings = load_settings(config)
+        options = settings.run_options()
+        try:
+            proposal = JsonObject(plan.read_text(encoding="utf-8"))
+            source = payload.read_text(encoding="utf-8")
+        except OSError as error:
+            raise HarnessError(
+                ErrorCode.VALIDATION, "Cannot read kernel plan or payload"
+            ) from error
+        pages = ContextPager(max(256, options.max_input_bytes // 2), 0).page(source)
+        async with application(settings, own_scheduler=True) as services:
+            run = await services.runs.submit(user, task, options)
+            root_id = str(json.loads(run.config.policy.text)["root_task_id"])
+            async with services.store.transaction(user) as tx:
+                root = await tx.get_task(root_id)
+            if root is None:
+                raise HarnessError(ErrorCode.STORAGE, "Kernel root task is missing")
+            compiled = PlanCompiler(
+                services.agent_factory.registry,
+                root.capabilities,
+                tuple(page.page_id for page in pages),
+            ).compile(proposal)
+            async with runner(services, settings, options) as agent:
+
+                async def execute_child(child: Task) -> Task:
+                    await agent.execute_task(user, run.run_id, child.task_id)
+                    async with services.store.transaction(user) as tx:
+                        result = await tx.get_task(child.task_id)
+                    if result is None:
+                        raise HarnessError(ErrorCode.STORAGE, "Kernel child task disappeared")
+                    return result
+
+                return await services.agent_orchestration_core.execute(
+                    user,
+                    run.run_id,
+                    compiled,
+                    pages,
+                    execute_child,
+                    agent.execute_task,
+                )
+
+    result = asyncio.run(execute_kernel())
+    typer.echo(json.dumps(summary(result), indent=2))
+    if result.status not in {RunStatus.COMPLETED, RunStatus.PARTIAL}:
         raise typer.Exit(1)
 
 
@@ -309,7 +371,6 @@ async def inspect_run(
         async with services.store.transaction(user) as tx:
             steps = await tx.steps(run_id)
             invocations = await tx.invocations(run_id)
-            artifacts = await tx.artifacts(run_id)
             tasks = await tx.tasks(run_id)
             root_task_id = str(json.loads(run.config.policy.text)["root_task_id"])
             budget = await tx.budget_snapshot(root_task_id)
@@ -336,16 +397,6 @@ async def inspect_run(
                 else None,
             }
             for i in invocations
-        ]
-        result["artifacts"] = [
-            {
-                "artifact_id": a.artifact_id,
-                "name": a.name,
-                "version": a.version,
-                "status": a.status,
-                "checksum": a.checksum,
-            }
-            for a in artifacts
         ]
         result["tasks"] = [
             {

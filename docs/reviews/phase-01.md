@@ -15,7 +15,7 @@ optimistic conflicts, atomic state/event writes, rollback, append-only event
 triggers, foreign keys, WAL and two ordered migrations are implemented.
 
 New implementation files: `domain/{__init__,entities,states,errors}.py`,
-`ports/{__init__,state}.py`, `adapters/{__init__,system}.py`, and
+`protocols/{__init__,state}.py`, `adapters/{__init__,system}.py`, and
 `persistence/{__init__,codec,migrations,sqlite}.py` under `src/agent_harness/`.
 Public contracts are documented in [durable-state.md](../durable-state.md).
 

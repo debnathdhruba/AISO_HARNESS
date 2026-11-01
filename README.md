@@ -1,15 +1,46 @@
 # Agent Harness
 
 A local, durable agent that can answer questions, inspect and edit files in a
-chosen workspace, create artifacts, and split larger tasks among task-focused
-workers. With Ollama, a unified model interface uses LFM 2.5 Thinking to choose
-an answer or a tool call, while Gemma 3 1B writes the final response. The
-harness—not either model—authorizes and executes tools. Responses appear after
+local filesystem and split larger tasks among task-focused workers. With
+Ollama, LFM 2.5 Thinking handles ordinary answers and tool calls. Gemma 3 1B
+is reserved for content-heavy work such as summaries and kernel-result synthesis.
+The harness authorizes and executes tools. Responses appear after
 each task completes.
 
 Runs, model steps, tool activity, checkpoints, budgets, and optional memory are
-stored in MongoDB. The agent uses only the tools and workspace permissions
-configured for the run.
+stored in MongoDB. File tools accept paths anywhere on the local filesystem;
+write approval can be required for mutations.
+
+## Deterministic agent-orchestration-core runs
+
+`kernel-run` executes a predeclared, strictly validated DAG. The kernel owns
+dependencies, capabilities, paging, retries, and bounded parallel admission;
+workers receive an isolated task frame and return a result only. Workers never
+emit scheduling syscalls or communicate with each other directly.
+Their page inputs, private frames, and dependency results flow through
+capability-scoped, immutable in-memory key/value entries managed by the kernel.
+
+The ordinary `run` command automatically activates this kernel path for large
+requests and when any model frame exceeds its context budget. Recovery covers
+tool results, retained history, memory context, delegated tasks, and synthesis.
+The one-shot planner sees the task objective and page metadata, then validated
+independent workers process page frames concurrently. Configure early admission
+with `auto_kernel_trigger_bytes` (default `8192`) or disable automatic recovery
+with `auto_kernel_enabled = false`.
+
+```powershell
+.\.venv\Scripts\python.exe -m agent_harness.interfaces.cli kernel-run `
+  --task "Review this document" `
+  --plan examples/kernel-plan.json `
+  --payload README.md `
+  --user local-user `
+  --config examples/ollama.toml
+```
+
+Plans are limited to eight acyclic tasks. The runtime rejects malformed plans,
+unknown dependency/page references, unauthorized capabilities, and invalid
+agent definitions before any worker is scheduled. Independent ready tasks run
+concurrently only within the configured task/model/tool resource limits.
 
 ## Get started
 
@@ -27,8 +58,8 @@ ollama pull lfm2.5-thinking:1.2b
 Set `AGENT_HARNESS_MONGODB_URI` in `.env` to your own MongoDB connection string.
 Keep credentials private and URL-encode reserved characters in the password.
 The database defaults to `test`. Do not commit `.env`.
-The default workspace is the current directory; `run.bat` starts in this
-`AIOS_HARNESS` folder. Set `workspace` in the TOML config to use another folder.
+Relative file paths use the process current directory. `run.bat` starts in this
+`AIOS_HARNESS` folder. File tools also accept absolute paths elsewhere on disk.
 
 Run one task:
 
@@ -51,16 +82,16 @@ its Ollama connection. You can also use the `chat` command directly:
 
 ## Tasks to try
 
-Try these prompts in chat. The file examples use the current workspace, so
+Try these prompts in chat. The file examples use the current directory, so
 start with read-only requests before asking for a change.
 
 1. **General answer:** “Explain what a queue is in one sentence.”
-2. **Find a file:** “List the files in the workspace root.”
+2. **Find a file:** “List the files in the current directory.”
 3. **Read a small section:** “Read lines 1–30 of README.md.”
-4. **Search the workspace:** “Find where `model_provider_concurrency` is configured and summarize the setting.”
+4. **Search files:** “Find where `model_provider_concurrency` is configured in `C:\Users\dhruba\Downloads\projects\AIOS` and summarize the setting.”
 5. **Calculate:** “Calculate 24 × 17 and show the arithmetic.”
-6. **Create an artifact:** “Write a text artifact named `queue-notes.txt` that explains FIFO in two sentences, then read it back.”
-7. **Inspect and summarize:** “Read README.md, find the resource scheduling defaults in the workspace, and list the model, tool, artifact, and memory capacities with their total.”
+6. **Write a file:** “Write two sentences about FIFO to `C:\Users\dhruba\Downloads\projects\AIOS\AIOS_HARNESS\queue-notes.txt`, then read it back.”
+7. **Inspect and summarize:** “Read `C:\Users\dhruba\Downloads\projects\AIOS\AIOS_HARNESS\README.md`, find the resource scheduling defaults in `C:\Users\dhruba\Downloads\projects\AIOS\AIOS_HARNESS`, and list the model, tool, and memory capacities with their total.”
 8. **Independent subtasks:** “In parallel, find the model concurrency defaults and the tool safety limits. Return each finding with its source file.”
 9. **Constrained output:** “Summarize the project in exactly three bullet points.”
 10. **Memory (optional):** After enabling memory in `examples/memory.toml`, say “Remember that I prefer concise answers,” then ask “How do I prefer answers?”

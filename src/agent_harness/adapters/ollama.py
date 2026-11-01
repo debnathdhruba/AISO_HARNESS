@@ -18,8 +18,9 @@ from agent_harness.domain.model import (
     ToolCall,
     Usage,
 )
+from agent_harness.logger import audit
 from agent_harness.models.context import size, tool_schema_size
-from agent_harness.ports.model import TokenCallback
+from agent_harness.protocols.model import TokenCallback
 
 
 class FunctionPayload(BaseModel):
@@ -140,7 +141,15 @@ class OllamaClient:
         assert self._http is not None
         try:
             async with self._http.stream("POST", path, json=payload) as response:
-                self._validate_http_status(response.status_code)
+                if response.status_code != 200:
+                    detail = (await response.aread()).decode("utf-8", errors="replace")[:300]
+                    self._raise_context_overflow(detail)
+                    audit(
+                        "ollama.request_rejected",
+                        status_code=response.status_code,
+                        detail=detail,
+                    )
+                    self._validate_http_status(response.status_code)
                 data = bytearray()
                 async for chunk in response.aiter_bytes():
                     data.extend(chunk)
@@ -194,6 +203,7 @@ class OllamaClient:
                 response.eval_count,
             )
         except (ValidationError, ValueError, TypeError):
+            self._raise_context_overflow(raw.decode("utf-8", errors="replace")[:1000])
             raise HarnessError(ErrorCode.VALIDATION, "Malformed Ollama chat response") from None
 
     async def generate_stream(
@@ -213,7 +223,15 @@ class OllamaClient:
         total_bytes = 0
         try:
             async with self._http.stream("POST", "/api/chat", json=payload) as response:
-                self._validate_http_status(response.status_code)
+                if response.status_code != 200:
+                    detail = (await response.aread()).decode("utf-8", errors="replace")[:300]
+                    self._raise_context_overflow(detail)
+                    audit(
+                        "ollama.request_rejected",
+                        status_code=response.status_code,
+                        detail=detail,
+                    )
+                    self._validate_http_status(response.status_code)
                 async for line in response.aiter_lines():
                     if not line:
                         continue
@@ -225,6 +243,7 @@ class OllamaClient:
                     try:
                         chunk = ChatChunkPayload.model_validate_json(line)
                     except (ValidationError, ValueError, TypeError):
+                        self._raise_context_overflow(line[:1000])
                         raise HarnessError(
                             ErrorCode.VALIDATION, "Malformed Ollama streaming response"
                         ) from None
@@ -327,21 +346,43 @@ class OllamaClient:
                     + 512,
                 ),
             },
-            "keep_alive": "5m",
         }
+
+    @staticmethod
+    def _raise_context_overflow(detail: str) -> None:
+        normalized = detail.casefold()
+        markers = (
+            "context length",
+            "context window",
+            "maximum context",
+            "context limit",
+            "too many tokens",
+            "prompt is too long",
+            "input is too long",
+            "exceeds the context",
+            "input length exceeds",
+            "number of tokens exceeds",
+            "context size exceeded",
+        )
+        if any(marker in normalized for marker in markers):
+            raise HarnessError(
+                ErrorCode.BUDGET_EXCEEDED,
+                "Ollama rejected the prompt because it exceeds the model context window",
+            )
 
     @staticmethod
     def _validate_http_status(status_code: int) -> None:
         if status_code >= 500 or status_code == 429:
             raise HarnessError(
                 ErrorCode.TRANSIENT_PROVIDER,
-                "Local Ollama is temporarily unavailable",
+                f"Local Ollama is temporarily unavailable (HTTP {status_code})",
                 retryable=True,
             )
         if status_code != 200:
             raise HarnessError(
                 ErrorCode.PERMANENT_PROVIDER,
-                "Ollama rejected the request; check installed model names",
+                "Ollama rejected the request "
+                f"(HTTP {status_code}); see ollama.request_rejected log",
             )
 
     @staticmethod

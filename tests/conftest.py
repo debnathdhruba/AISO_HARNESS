@@ -7,7 +7,7 @@ import pytest
 import pytest_asyncio
 
 from agent_harness.domain.entities import Run, RunConfig, Task
-from agent_harness.persistence.sqlite import SQLiteStore
+from agent_harness.memory.backends.sqlite import SQLiteStore
 
 
 class FixedClock:

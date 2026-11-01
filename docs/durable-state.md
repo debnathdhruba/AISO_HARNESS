@@ -1,13 +1,13 @@
 # Phase 1 durable state contracts
 
 Implemented sources: `domain/entities.py`, `domain/states.py`, `domain/errors.py`,
-`ports/state.py`, `adapters/system.py`, and `persistence/`.
+`protocols/state.py`, `adapters/system.py`, and `memory/backends/` (the original
+Phase 1 state backend, now grouped under the unified memory package).
 
 ## Entities and identifiers
 
-RunConfig snapshots definition/version, model, policy, budget, memory and workspace
-settings. Model settings retain separate workspace and artifact-root paths for
-recovery. Run stores principal, input, status, timestamps, deadline, version,
+RunConfig snapshots definition/version, model, policy, budget, and memory
+settings. Run stores principal, input, status, timestamps, deadline, version,
 control intent, result and error. Task stores scope, objective, acceptance criteria,
 parent/dependencies, assigned instance ID, status, timestamps, deadline, version
 and result. IDs are canonical UUIDs; UUID generation and UTC/monotonic time are
@@ -58,24 +58,14 @@ at safe execution boundaries; cancellation intent cannot be revoked.
 
 | Collection | Key / indexes | Role |
 | --- | --- | --- |
-| runs | run UUID; user/status index | Run snapshot, status/version and control intent |
-| tasks | task UUID; run/user/status index | Task snapshot, parent and assigned agent |
-| task_dependencies | task/dependency/run/user unique index | Durable dependency references |
-| delegations | parent/idempotency-key unique; child unique | Idempotent child creation |
-| events | run/sequence unique index | Append-only versioned metadata |
-| checkpoints | task UUID | Versioned serialized continuation |
-| steps | step UUID; task/ordinal unique index | Complete model request and accepted response |
-| invocations | invocation UUID; step/call unique index | Tool identity, arguments, state, result and error |
-| approvals | invocation UUID | User decision bound to exact tool version and arguments |
-| artifacts | artifact UUID; user/run/task/name/version unique index | Bounded artifact manifest and integrity metadata |
-| budget_accounts | task UUID; run/user index | Hierarchical limits, used/reserved totals, unknown usage count |
-| budget_reservations | reservation UUID; run/task/status index | Idempotent per-operation reservation and reconciliation state |
-| process_ownership | fixed scheduler lease ID | Expiring scheduler owner lease, process ID, and heartbeat |
-| memory_records | record UUID; user/deletion/sharing/owner/update index | User-scoped private/shared facts, retrieval tags, provenance and soft deletion |
+| telemetry | `_kind` plus record-specific fields and IDs | All durable run traces: runs, tasks, dependencies, delegations, events, checkpoints, model steps, tool invocations, and approvals |
+| memory | `_kind=memory_records`; user/deletion/sharing/owner/update index | User-scoped private/shared facts, retrieval tags, provenance and soft deletion |
+| control | `_kind` plus budget/lease IDs and query fields | Budget accounts/reservations and scheduler ownership lease |
 
-Collections and indexes are ensured at application startup; MongoDB has no
-SQLite-style numbered schema migrations here. Existing local SQLite databases
-are intentionally not imported. The configured URI is held in `SecretStr`, is
+Collections and indexes are ensured at application startup. New MongoDB state
+uses these three collections; existing per-entity collections are left as-is and
+are not migrated or deleted. Existing local SQLite databases are intentionally
+not imported. The configured URI is held in `SecretStr`, is
 excluded from run snapshots, and should be provided through
 `AGENT_HARNESS_MONGODB_URI`.
 Structured snapshots, event payloads, and checkpoint continuations are stored
@@ -84,8 +74,8 @@ the earlier string-encoded format for existing records.
 
 ## Hierarchical budgets and completion (Phase 6)
 
-`budget_accounts` and `budget_reservations` are MongoDB collections and are
-updated in the same MongoDB transaction as the corresponding run events.
+Budget account and reservation documents in `control` are updated in the same
+MongoDB transaction as the corresponding run events in `telemetry`.
 Reservations charge the task and all ancestors. Duplicate reservation IDs with
 the same task and amount are idempotent; reuse with different work is rejected.
 Reconciliation is immutable and idempotent. Unknown usage consumes the
@@ -95,10 +85,10 @@ replaces that token bound on reconciliation. Tool attempts reserve one call
 before execution. Retries create separate attempts and therefore consume
 additional budget.
 
-Completion decisions are deterministic and appended to the existing MongoDB
-`events` collection as `completion.validated`. A candidate must have no
-unresolved tool actions or required children; configured committed artifact
-names and JSON Schema constraints are also checked. Failed candidates receive
+Completion decisions are deterministic and appended to the `events` record kind
+in MongoDB `telemetry` as `completion.validated`. A candidate must have no
+unresolved tool actions or required children; configured JSON Schema constraints
+are also checked. Failed candidates receive
 bounded correction attempts. Partial child outcomes require the explicit
 `partial_result_policy = "allow"` setting.
 
@@ -109,7 +99,7 @@ transaction behavior has not been live-validated against Atlas for this phase.
 
 ## Recovery and process ownership (Phase 7)
 
-The fixed `process_ownership` document is a MongoDB lease with owner UUID,
+The fixed `process_ownership` document in `control` is a MongoDB lease with owner UUID,
 process ID, heartbeat, and expiry. A scheduler process must acquire the lease
 before startup recovery or task execution. A heartbeat renews it; loss of the
 lease stops new model/tool admissions and prevents the stale process from
@@ -145,16 +135,15 @@ need deployment-level validation.
 ## Database and agent trace
 
 The default MongoDB database name is `test`. There is no second trace database
-to keep synchronized. The same MongoDB database contains the full durable trace:
-`steps` stores the exact model and messages
-sent plus the accepted assistant response; `invocations` stores tool arguments,
-status, result and error; `events` stores the ordered run/task/step/tool state
-transitions. The `trace RUN_ID` CLI command combines these records, including
-private prompt and tool data, after enforcing run ownership. `runs` and `tasks`
-hold current state, `checkpoints` enables continuation, `approvals` records
-write decisions, and `artifacts` indexes workspace outputs. `task_dependencies`
-records child execution dependencies, and `delegations` maps parent/idempotency
-key pairs to child tasks to prevent duplicate creation after repeated requests.
+to keep synchronized. The same MongoDB database contains the full durable trace
+in `telemetry`: typed `steps` records store the exact model messages and accepted
+response; `invocations` records store tool arguments, status, result and error;
+`events` records store ordered state transitions. The `trace RUN_ID` CLI command
+combines these records, including private prompt and tool data, after enforcing
+run ownership. Typed `runs` and `tasks` records hold current state, checkpoints
+enable continuation, and approvals record write decisions. Typed dependency
+and delegation records preserve child
+execution requirements and prevent duplicate child creation.
 
 This trace contains potentially sensitive prompts and tool data. Restrict
 database credentials and access, and avoid sharing trace output without reviewing it.
@@ -163,7 +152,7 @@ database credentials and access, and avoid sharing trace output without reviewin
 
 The application composition root owns one `ResourceScheduler` and shares it with
 all run runners in that application lifetime. Model calls use the configured
-provider key; tools and filesystem/artifact operations use separate bounded
+provider key; tools and memory operations use separate bounded
 lanes. A reserved memory lane is available for the later memory phase. Limits
 include global active capacity, finite queue length, and model per-provider
 capacity. Queue-full, queued cancellation, timeout, and shutdown are distinct
@@ -225,7 +214,7 @@ cross-process budget admission remain unverified.
 
 ## User memory and context (Phase 8)
 
-`memory_records` is the MongoDB-only durable store for selected facts. Each
+`memory` is the MongoDB-only durable store for selected facts. Each
 record has a user, owning agent definition, private/shared policy, tags,
 optional run/task provenance, creation/update timestamps, and soft-deletion
 timestamp. Private reads require the same user and owner definition; shared

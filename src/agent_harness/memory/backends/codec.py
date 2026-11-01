@@ -22,8 +22,9 @@ def decode_run(text: str) -> Run:
     require(snapshot["schema_version"] == 1, "Unsupported run snapshot version")
     data = snapshot["data"]
     config = data.pop("config")
-    for key in ("model", "policy", "budgets", "memory", "workspace"):
+    for key in ("model", "policy", "budgets", "memory"):
         config[key] = JsonObject(**config[key])
+    config.pop("workspace", None)
     data["config"] = RunConfig(**config)
     data["status"] = RunStatus(data["status"])
     data["intent"] = ControlIntent(data["intent"])

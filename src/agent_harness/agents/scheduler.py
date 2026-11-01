@@ -7,6 +7,7 @@ from dataclasses import dataclass
 
 from agent_harness.domain.entities import Task
 from agent_harness.domain.errors import ErrorCode, HarnessError, require
+from agent_harness.logger import audit
 
 
 @dataclass
@@ -52,7 +53,9 @@ class TaskScheduler:
             require(not self._closed, "Task scheduler is shut down")
             queued = sum(len(queue) for queue in self._queues.values())
             if queued + len(tasks) > self._queue_capacity:
-                raise HarnessError(ErrorCode.QUEUE_FULL, "Task queue capacity is full", retryable=True)
+                raise HarnessError(
+                    ErrorCode.QUEUE_FULL, "Task queue capacity is full", retryable=True
+                )
             for task, future in zip(tasks, futures, strict=True):
                 queue = self._queues.setdefault(task.run_id, deque())
                 queue.append(_QueuedTask(task, execute, future, active_limit))
@@ -101,6 +104,12 @@ class TaskScheduler:
                     self._queues.pop(run_id, None)
                 worker = asyncio.create_task(self._execute(item))
                 self._workers[item.result] = worker
+                audit(
+                    "task.scheduler.dispatched",
+                    run_id=item.task.run_id,
+                    task_id=item.task.task_id,
+                    active=self._active,
+                )
 
     async def _execute(self, item: _QueuedTask) -> None:
         try:
@@ -116,6 +125,11 @@ class TaskScheduler:
             if not item.result.done():
                 item.result.set_result(result)
         finally:
+            audit(
+                "task.scheduler.released",
+                run_id=item.task.run_id,
+                task_id=item.task.task_id,
+            )
             async with self._lock:
                 self._active -= 1
                 active = self._active_by_run[item.task.run_id] - 1

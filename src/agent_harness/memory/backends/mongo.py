@@ -28,16 +28,14 @@ from agent_harness.domain.states import (
     TaskStatus,
     validate_transition,
 )
-from agent_harness.domain.tooling import Approval, ArtifactRecord, Effect, Invocation
-from agent_harness.models.codec import decode_step, encode_step
-from agent_harness.persistence.codec import decode_run, decode_task, encode
-from agent_harness.persistence.tool_codec import (
-    decode_artifact,
+from agent_harness.domain.tooling import Approval, Effect, Invocation
+from agent_harness.memory.backends.codec import decode_run, decode_task, encode
+from agent_harness.memory.backends.tool_codec import (
     decode_invocation,
-    encode_artifact,
     encode_invocation,
 )
-from agent_harness.ports.state import Clock, IdGenerator, StateTransaction
+from agent_harness.models.codec import decode_step, encode_step
+from agent_harness.protocols.state import Clock, IdGenerator, StateTransaction
 
 Document = dict[str, Any]
 P = ParamSpec("P")
@@ -48,7 +46,6 @@ RUN_JSON_PATHS = (
     ("data", "config", "policy"),
     ("data", "config", "budgets"),
     ("data", "config", "memory"),
-    ("data", "config", "workspace"),
     ("data", "result"),
     ("data", "error"),
 )
@@ -68,6 +65,88 @@ STEP_JSON_PATHS = (
 INVOCATION_JSON_PATHS = (("arguments",), ("result",), ("error",))
 OWNERSHIP_LEASE_ID = "agent-harness-scheduler"
 OWNERSHIP_LEASE_SECONDS = 30
+
+COLLECTION_BUCKETS = {
+    "memory_records": "memory",
+    "budget_accounts": "control",
+    "budget_reservations": "control",
+    "process_ownership": "control",
+}
+
+
+class _LogicalCollection:
+    """A typed view over one of the three physical MongoDB collections."""
+
+    def __init__(self, database: Any, name: str) -> None:
+        self._collection = database[COLLECTION_BUCKETS.get(name, "telemetry")]
+        self._kind = name
+
+    def _query(self, query: Document | None) -> Document:
+        def prefix_ids(value: Any) -> Any:
+            if isinstance(value, dict):
+                return {key: prefix_ids(item) for key, item in value.items()}
+            if isinstance(value, list):
+                return [prefix_ids(item) for item in value]
+            return value
+
+        criteria = prefix_ids(query or {})
+        if "_id" in criteria:
+            value = criteria["_id"]
+            if isinstance(value, dict):
+                criteria["_id"] = {
+                    operator: [f"{self._kind}:{item}" for item in items]
+                    if operator in {"$in", "$nin"}
+                    else f"{self._kind}:{items}"
+                    for operator, items in value.items()
+                }
+            else:
+                criteria["_id"] = f"{self._kind}:{value}"
+        return {"$and": [{"_kind": self._kind}, criteria]}
+
+    def _document(self, document: Document) -> Document:
+        value = dict(document)
+        original_id = value.get("_id")
+        if original_id is not None:
+            value["_id"] = f"{self._kind}:{original_id}"
+        value["_kind"] = self._kind
+        return value
+
+    def find(self, query: Document | None = None, *args: Any, **kwargs: Any) -> Any:
+        return self._collection.find(self._query(query), *args, **kwargs)
+
+    async def find_one(self, query: Document | None = None, *args: Any, **kwargs: Any) -> Any:
+        return await self._collection.find_one(self._query(query), *args, **kwargs)
+
+    async def insert_one(self, document: Document, *args: Any, **kwargs: Any) -> Any:
+        return await self._collection.insert_one(self._document(document), *args, **kwargs)
+
+    async def update_one(self, query: Document, update: Document, *args: Any, **kwargs: Any) -> Any:
+        value = dict(update)
+        insert_fields = dict(value.get("$setOnInsert", {}))
+        insert_fields["_kind"] = self._kind
+        value["$setOnInsert"] = insert_fields
+        return await self._collection.update_one(self._query(query), value, *args, **kwargs)
+
+    async def replace_one(
+        self, query: Document, replacement: Document, *args: Any, **kwargs: Any
+    ) -> Any:
+        return await self._collection.replace_one(
+            self._query(query), self._document(replacement), *args, **kwargs
+        )
+
+    async def delete_one(self, query: Document, *args: Any, **kwargs: Any) -> Any:
+        return await self._collection.delete_one(self._query(query), *args, **kwargs)
+
+    async def find_one_and_update(
+        self, query: Document, update: Document, *args: Any, **kwargs: Any
+    ) -> Any:
+        value = dict(update)
+        insert_fields = dict(value.get("$setOnInsert", {}))
+        insert_fields["_kind"] = self._kind
+        value["$setOnInsert"] = insert_fields
+        return await self._collection.find_one_and_update(
+            self._query(query), value, *args, **kwargs
+        )
 
 
 def _update_path(value: Any, path: tuple[str, ...], transform: Callable[[Any], Any]) -> Any:
@@ -213,6 +292,9 @@ class MongoStore:
             self._opened = True
         return self
 
+    def _collection(self, name: str) -> _LogicalCollection:
+        return _LogicalCollection(self._database, name)
+
     async def __aexit__(self, *_: object) -> None:
         require(
             self._transaction_owner is not asyncio.current_task(),
@@ -238,7 +320,7 @@ class MongoStore:
                 for key, value in document.items()
                 if key not in {"_id", "created_at", "updated_at"}
             }
-            await self._database["memory_records"].update_one(
+            await self._collection("memory_records").update_one(
                 {"_id": record.record_id, **identity},
                 {"$setOnInsert": document},
                 upsert=True,
@@ -253,13 +335,13 @@ class MongoStore:
 
     async def _validate_memory_provenance(self, record: MemoryRecord) -> None:
         if record.source_run_id is not None:
-            run = await self._database["runs"].find_one(
+            run = await self._collection("runs").find_one(
                 {"run_id": record.source_run_id, "user_id": record.user_id},
                 projection={"_id": 1},
             )
             require(run is not None, "Memory run provenance is unavailable")
         if record.source_task_id is not None:
-            row = await self._database["tasks"].find_one(
+            row = await self._collection("tasks").find_one(
                 {
                     "task_id": record.source_task_id,
                     "run_id": record.source_run_id,
@@ -279,7 +361,7 @@ class MongoStore:
     ) -> MemoryRecord | None:
         require(self._opened, "Mongo store is not open")
         try:
-            document = await self._database["memory_records"].find_one(
+            document = await self._collection("memory_records").find_one(
                 {
                     "_id": record_id,
                     "user_id": user_id,
@@ -302,7 +384,7 @@ class MongoStore:
         document = self._memory_document(record)
         document.pop("_id")
         try:
-            result = await self._database["memory_records"].update_one(
+            result = await self._collection("memory_records").update_one(
                 {
                     "_id": record.record_id,
                     "user_id": record.user_id,
@@ -326,7 +408,7 @@ class MongoStore:
     ) -> None:
         require(self._opened, "Mongo store is not open")
         try:
-            result = await self._database["memory_records"].update_one(
+            result = await self._collection("memory_records").update_one(
                 {
                     "_id": record_id,
                     "user_id": user_id,
@@ -347,7 +429,7 @@ class MongoStore:
         require(1 <= limit <= 500, "Invalid memory candidate limit")
         try:
             cursor = (
-                self._database["memory_records"]
+                self._collection("memory_records")
                 .find(
                     {
                         "user_id": user_id,
@@ -376,7 +458,7 @@ class MongoStore:
         owner_id = str(uuid4())
         now = self._clock.utc_now()
         try:
-            lease = await self._database["process_ownership"].find_one_and_update(
+            lease = await self._collection("process_ownership").find_one_and_update(
                 {
                     "_id": OWNERSHIP_LEASE_ID,
                     "$or": [
@@ -420,7 +502,7 @@ class MongoStore:
                 heartbeat.cancel()
                 await asyncio.gather(heartbeat, return_exceptions=True)
             self._scheduler_owner_id = None
-            await self._database["process_ownership"].delete_one(
+            await self._collection("process_ownership").delete_one(
                 {"_id": OWNERSHIP_LEASE_ID, "owner_id": owner_id}
             )
 
@@ -430,7 +512,7 @@ class MongoStore:
             now = self._clock.utc_now()
             try:
                 async with self._transaction_lock:
-                    result = await self._database["process_ownership"].update_one(
+                    result = await self._collection("process_ownership").update_one(
                         {
                             "_id": OWNERSHIP_LEASE_ID,
                             "owner_id": owner_id,
@@ -456,7 +538,7 @@ class MongoStore:
         now = self._clock.utc_now()
         # Expiration permits takeover; matching owner_id prevents a stale owner renewing afterward.
         try:
-            result = await self._database["process_ownership"].update_one(
+            result = await self._collection("process_ownership").update_one(
                 {
                     "_id": OWNERSHIP_LEASE_ID,
                     "owner_id": owner_id,
@@ -476,7 +558,7 @@ class MongoStore:
         require(
             self._scheduler_owner_id is not None, "Scheduler ownership is required for recovery"
         )
-        cursor = self._database["runs"].find(
+        cursor = self._collection("runs").find(
             {
                 "status": {
                     "$in": [
@@ -522,13 +604,6 @@ class MongoStore:
                 ("call_id", ASCENDING),
             ),
             "approvals": (("user_id", ASCENDING),),
-            "artifacts": (
-                ("user_id", ASCENDING),
-                ("run_id", ASCENDING),
-                ("task_id", ASCENDING),
-                ("name", ASCENDING),
-                ("version", ASCENDING),
-            ),
             "delegations": (
                 ("parent_task_id", ASCENDING),
                 ("idempotency_key", ASCENDING),
@@ -553,15 +628,18 @@ class MongoStore:
         unique_compound = {
             "task_dependencies",
             "steps",
-            "artifacts",
             "delegations",
             "events",
             "invocations",
         }
         indexes: dict[str, list[IndexModel]] = {}
         for collection_name, keys in definitions.items():
-            indexes.setdefault(collection_name, []).append(
-                IndexModel(list(keys), unique=collection_name in unique_compound)
+            physical = COLLECTION_BUCKETS.get(collection_name, "telemetry")
+            indexes.setdefault(physical, []).append(
+                IndexModel(
+                    [("_kind", ASCENDING), *keys],
+                    unique=collection_name in unique_compound,
+                )
             )
         for collection_name, field in (
             ("events", "event_id"),
@@ -570,24 +648,30 @@ class MongoStore:
             ("steps", "step_id"),
             ("invocations", "invocation_id"),
             ("approvals", "invocation_id"),
-            ("artifacts", "artifact_id"),
             ("checkpoints", "task_id"),
         ):
-            indexes.setdefault(collection_name, []).append(IndexModel(field, unique=True))
+            physical = COLLECTION_BUCKETS.get(collection_name, "telemetry")
+            indexes.setdefault(physical, []).append(
+                IndexModel([("_kind", ASCENDING), (field, ASCENDING)], unique=True)
+            )
         for collection_name, field in (
             ("delegations", "child_task_id"),
             ("budget_accounts", "task_id"),
             ("budget_reservations", "reservation_id"),
         ):
-            indexes.setdefault(collection_name, []).append(IndexModel(field, unique=True))
-        indexes["invocations"].append(
+            physical = COLLECTION_BUCKETS.get(collection_name, "telemetry")
+            indexes.setdefault(physical, []).append(
+                IndexModel([("_kind", ASCENDING), (field, ASCENDING)], unique=True)
+            )
+        indexes["telemetry"].append(
             IndexModel(
                 [
+                    ("_kind", ASCENDING),
                     ("user_id", ASCENDING),
                     ("run_id", ASCENDING),
                     ("task_id", ASCENDING),
                 ],
-                name="invocations_user_run_task",
+                name="telemetry_invocations_user_run_task",
             )
         )
         await asyncio.gather(
@@ -700,7 +784,7 @@ class MongoTransaction:
 
     def _collection(self, name: str) -> Any:
         self.check_active()
-        return self._db[name]
+        return _LogicalCollection(self._db, name)
 
     async def _find(
         self,
@@ -1452,64 +1536,6 @@ class MongoTransaction:
             InvocationStatus.AWAITING_APPROVAL,
         )
 
-    async def artifacts(self, run_id: str) -> tuple[ArtifactRecord, ...]:
-        return tuple(
-            decode_artifact(
-                row["snapshot"] if isinstance(row["snapshot"], str) else json.dumps(row["snapshot"])
-            )
-            for row in await self._find(
-                "artifacts",
-                {"run_id": run_id, "user_id": self._user},
-                sort=(("name", ASCENDING), ("version", ASCENDING)),
-            )
-        )
-
-    @mutation
-    async def save_artifact(self, artifact: ArtifactRecord, expected: str | None) -> None:
-        self._scope(artifact.user_id)
-        row = await self._collection("artifacts").find_one(
-            {"artifact_id": artifact.artifact_id, "run_id": artifact.run_id, "user_id": self._user},
-            session=self._session,
-        )
-        previous = (
-            decode_artifact(
-                row["snapshot"] if isinstance(row["snapshot"], str) else json.dumps(row["snapshot"])
-            )
-            if row
-            else None
-        )
-        if (previous.status if previous else None) != expected:
-            raise conflict()
-        document = {
-            "_id": artifact.artifact_id,
-            "artifact_id": artifact.artifact_id,
-            "run_id": artifact.run_id,
-            "task_id": artifact.task_id,
-            "user_id": artifact.user_id,
-            "name": artifact.name,
-            "version": artifact.version,
-            "status": artifact.status,
-            "snapshot": json.loads(encode_artifact(artifact)),
-        }
-        if previous is None:
-            require(artifact.status == "staged", "New manifest must be staged")
-            await self._collection("artifacts").insert_one(document, session=self._session)
-        else:
-            require(
-                previous.status == "staged"
-                and artifact.status == "committed"
-                and replace(previous, status="committed") == artifact,
-                "Invalid manifest transition",
-            )
-            result = await self._collection("artifacts").replace_one(
-                {"artifact_id": artifact.artifact_id, "status": "staged", "user_id": self._user},
-                document,
-                session=self._session,
-            )
-            if result.matched_count != 1:
-                raise conflict()
-        await self._event(artifact.run_id, f"artifact.{artifact.status}", task_id=artifact.task_id)
-
     @mutation
     async def create_step(self, step: Step) -> None:
         self._scope(step.user_id)
@@ -1934,7 +1960,11 @@ class MongoTransaction:
             raise HarnessError(ErrorCode.AUTHORIZATION, "Task is unavailable to this principal")
         if task.version != expected_version:
             raise conflict()
-        require(task.status == TaskStatus.READY, "Handoff can only be finalized before execution")
+        started = await self.steps(task.run_id, task_id)
+        require(
+            task.status == TaskStatus.READY or (task.status == TaskStatus.RUNNING and not started),
+            "Handoff can only be finalized before model execution",
+        )
         updated = replace(
             task,
             handoff=handoff,

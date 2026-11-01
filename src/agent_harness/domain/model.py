@@ -161,9 +161,6 @@ class RunOptions:
     max_input_bytes: int = 16384
     tool_allowlist: tuple[str, ...] = (
         "calculator",
-        "artifact_write",
-        "artifact_read",
-        "artifact_list",
         "list_files",
         "read_file",
         "read_file_range",
@@ -175,8 +172,6 @@ class RunOptions:
     max_tool_calls: int = 8
     repeated_action_limit: int = 2
     require_write_approval: bool = False
-    workspace: str = "."
-    artifact_root: str = ".local/artifacts"
     required_tools: tuple[str, ...] = ()
     routing_mode: str = "auto"
     response_max_tokens: int = 512
@@ -187,12 +182,13 @@ class RunOptions:
     max_retries: int = 0
     max_corrections: int = 1
     partial_result_policy: str = "fail"
-    required_artifacts: tuple[str, ...] = ()
     result_schema: JsonObject = JsonObject()
     memory_retrieval_enabled: bool = False
     memory_extraction_enabled: bool = False
     memory_retrieval_limit: int = 5
     memory_context_bytes: int = 2048
+    auto_kernel_enabled: bool = True
+    auto_kernel_trigger_bytes: int = 8192
 
     def __post_init__(self) -> None:
         require(self.provider in {"fake", "ollama"}, "Unsupported provider")
@@ -222,12 +218,12 @@ class RunOptions:
             "Invalid partial-result policy",
         )
         require(
-            all(bool(name.strip()) for name in self.required_artifacts),
-            "Required artifact names cannot be empty",
-        )
-        require(
             1 <= self.memory_retrieval_limit <= 20 and 128 <= self.memory_context_bytes <= 16384,
             "Invalid memory retrieval limits",
+        )
+        require(
+            1024 <= self.auto_kernel_trigger_bytes <= 131072,
+            "Invalid automatic agent_orchestration_core threshold",
         )
         require(
             isinstance(self.memory_retrieval_enabled, bool)
@@ -259,11 +255,16 @@ class RunOptions:
     def restore(cls, snapshot: JsonObject) -> "RunOptions":
         data = json.loads(snapshot.text)
         # Legacy Phase 2 runs had no tool authorization. Do not grant capabilities on resume.
-        data["tool_allowlist"] = tuple(data.get("tool_allowlist", ()))
-        data["required_tools"] = tuple(data.get("required_tools", ()))
-        data["required_artifacts"] = tuple(data.get("required_artifacts", ()))
+        data["tool_allowlist"] = tuple(
+            name for name in data.get("tool_allowlist", ()) if not name.startswith("artifact_")
+        )
+        data["required_tools"] = tuple(
+            name for name in data.get("required_tools", ()) if not name.startswith("artifact_")
+        )
         data["result_schema"] = JsonObject(**data.get("result_schema", {"text": "{}"}))
-        data.setdefault("artifact_root", data.get("workspace", ".local/artifacts"))
+        data.pop("workspace", None)
+        data.pop("artifact_root", None)
+        data.pop("required_artifacts", None)
         data.setdefault("routing_mode", "two_stage")
         data.setdefault("max_total_steps", max(data.get("max_steps", 8), 256))
         data.setdefault("max_total_tokens", 262144)
@@ -276,4 +277,6 @@ class RunOptions:
         data.setdefault("memory_extraction_enabled", False)
         data.setdefault("memory_retrieval_limit", 5)
         data.setdefault("memory_context_bytes", 2048)
+        data.setdefault("auto_kernel_enabled", True)
+        data.setdefault("auto_kernel_trigger_bytes", 8192)
         return cls(**data)

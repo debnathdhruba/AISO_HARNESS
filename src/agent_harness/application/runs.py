@@ -3,14 +3,14 @@
 import json
 from dataclasses import replace
 from datetime import timedelta
-from pathlib import Path
 
 from agent_harness.application.routing import infer_required_tool, select_mode
 from agent_harness.domain.entities import JsonObject, Run, RunConfig, Task
 from agent_harness.domain.errors import ErrorCode, HarnessError, require
 from agent_harness.domain.model import RunOptions
 from agent_harness.domain.states import ControlIntent, RunStatus, TaskStatus
-from agent_harness.ports.state import Clock, IdGenerator, StateStore
+from agent_harness.logger import audit
+from agent_harness.protocols.state import Clock, IdGenerator, StateStore
 
 
 class RunService:
@@ -38,8 +38,6 @@ class RunService:
         routing_mode = select_mode(task_input, options)
         options = replace(
             options,
-            workspace=str(Path(options.workspace).absolute()),
-            artifact_root=str(Path(options.artifact_root).absolute()),
             routing_mode=routing_mode,
         )
         if conversation_context:
@@ -106,7 +104,6 @@ class RunService:
             acceptance_criteria=JsonObject(
                 json.dumps(
                     {
-                        "required_artifacts": options.required_artifacts,
                         "result_schema": json.loads(options.result_schema.text),
                     }
                 )
@@ -121,7 +118,17 @@ class RunService:
             await tx.create_run(run)
             await tx.create_task(task)
             await tx.transition_task(task_id, 0, TaskStatus.READY)
-            return await tx.transition_run(run.run_id, 0, RunStatus.QUEUED)
+            queued = await tx.transition_run(run.run_id, 0, RunStatus.QUEUED)
+            audit(
+                "run.queued",
+                run_id=run.run_id,
+                task_id=task_id,
+                user_id=user_id,
+                input_bytes=len(task_input.encode("utf-8")),
+                routing_mode=options.routing_mode,
+                auto_kernel=options.auto_kernel_enabled,
+            )
+            return queued
 
     async def inspect(self, user_id: str, run_id: str) -> Run:
         async with self._store.transaction(user_id) as tx:
@@ -137,7 +144,9 @@ class RunService:
             run = await tx.get_run(run_id)
             if run is None:
                 raise HarnessError(ErrorCode.AUTHORIZATION, "Run is unavailable to this principal")
-            return await tx.set_intent(run_id, run.version, intent)
+            updated = await tx.set_intent(run_id, run.version, intent)
+            audit("run.control_requested", run_id=run_id, user_id=user_id, intent=intent.value)
+            return updated
 
     async def resume(self, user_id: str, run_id: str) -> Run:
         async with self._store.transaction(user_id) as tx:

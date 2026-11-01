@@ -7,7 +7,7 @@ from agent_harness.adapters.system import SystemClock, UuidGenerator
 from agent_harness.config import load_settings
 from agent_harness.domain.entities import Checkpoint, JsonObject, Run, RunConfig, Task
 from agent_harness.domain.states import RunStatus, TaskStatus
-from agent_harness.persistence.mongo import MongoStore
+from agent_harness.memory.backends.mongo import MongoStore
 
 
 async def demonstrate(database_name: str) -> None:

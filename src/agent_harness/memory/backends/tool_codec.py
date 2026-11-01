@@ -4,7 +4,7 @@ from datetime import datetime
 
 from agent_harness.domain.entities import JsonObject
 from agent_harness.domain.states import InvocationStatus
-from agent_harness.domain.tooling import ArtifactRecord, Effect, Invocation
+from agent_harness.domain.tooling import Effect, Invocation
 
 
 def encode_invocation(value: Invocation) -> str:
@@ -26,9 +26,3 @@ def decode_invocation(text: str) -> Invocation:
     return Invocation(**data)
 
 
-def encode_artifact(value: ArtifactRecord) -> str:
-    return json.dumps(asdict(value))
-
-
-def decode_artifact(text: str) -> ArtifactRecord:
-    return ArtifactRecord(**json.loads(text))

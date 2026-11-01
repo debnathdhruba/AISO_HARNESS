@@ -14,13 +14,13 @@ Cerebrum projects.
 | Layer | Responsibility | Main package |
 | --- | --- | --- |
 | Domain | Run/task state, messages, budgets, memory, tool contracts, errors | `domain/` |
-| Ports | Interfaces for models, persistence, and memory | `ports/` |
+| Protocols | Contracts for models, persistence, and memory | `protocols/` |
 | Application | Run submission, route selection, completion validation, delegation | `application/` |
 | Agent runtime | Agent definitions, per-task runner, child-task scheduler | `agents/` |
-| Model orchestration | Context sizing, model gateway, unified LFM-action/Gemma-answer adapter | `models/`, `llm/` |
-| Tools and artifacts | Tool registration/execution, workspace restrictions, artifact service | `tools/`, `artifacts/` |
+| Model orchestration | Context sizing, model gateway, task-sensitive LFM/Gemma routing | `models/`, `llm/` |
+| Tools | Tool registration/execution and local filesystem operations | `tools/` |
 | Scheduling | Bounded resource queues and bounded synchronous work | `scheduling/` |
-| Persistence | MongoDB production state and SQLite development/legacy adapter | `persistence/` |
+| Persistence backends | MongoDB production state and SQLite development/legacy adapter | `memory/backends/` |
 | Interfaces and wiring | Typer CLI, configuration, startup/shutdown composition | `interfaces/`, `bootstrap.py`, `config.py` |
 
 ### Source component map
@@ -31,28 +31,28 @@ Cerebrum projects.
 | `config.py` | Validates TOML, `AGENT_HARNESS_*` environment values, and CLI overrides; produces immutable run settings |
 | `domain/entities.py`, `states.py`, `errors.py` | Run/task/event/checkpoint identities, legal state transitions, and typed safe errors |
 | `domain/model.py`, `tooling.py`, `budgets.py`, `memory.py` | Provider-neutral model messages, tool contracts, budget values, and memory records |
-| `ports/model.py`, `state.py`, `memory.py` | Narrow contracts between orchestration and model/persistence/memory implementations |
+| `protocols/model.py`, `state.py`, `memory.py` | Narrow contracts between orchestration and model/persistence/memory implementations |
 | `application/runs.py` | Creates and inspects runs; records pause/cancel intents and validates resume preconditions |
 | `application/routing.py` | Selects a run mode with deterministic rules and explicit mode overrides |
 | `application/coordinator.py` | Validates, persists, orders, and gathers child tasks and their dependencies |
-| `application/completion.py` | Checks final candidate, required actions, child state, artifacts, and JSON Schema |
+| `application/completion.py` | Checks final candidate, required actions, child state, and JSON Schema |
 | `agents/factory.py` | Registers versioned agent definitions and creates capability-scoped task instances |
 | `agents/runner.py` | Executes one task's model/tool/checkpoint state machine and persists decisions before effects |
 | `agents/scheduler.py` | Fair, bounded admission for runnable delegated tasks |
 | `models/gateway.py` | Applies shared model-resource admission and checks normalized response types |
 | `models/context.py`, `models/codec.py` | Bound and group model context; serialize persisted steps |
 | `llm/router.py` | Parse route decisions, prepare compact tool handoffs, and safely extract answer text from JSON |
-| `llm/unified.py` | Expose one Ollama model interface; use LFM for structured action decisions and Gemma for final answers |
+| `llm/unified.py` | Route ordinary responses and tool decisions to LFM; use Gemma for content-heavy responses and synthesis |
 | `adapters/ollama.py` | Local Ollama HTTP client, model capability discovery, and response normalization |
 | `adapters/fake.py`, `adapters/system.py` | Deterministic offline model and injected clock/UUID implementations |
-| `tools/registry.py`, `builtins.py` | Versioned tool schemas/handlers and registration of built-in workspace, artifact, calculator, delegation, and memory tools |
+| `tools/registry.py`, `builtins.py` | Versioned tool schemas/handlers and registration of built-in filesystem, calculator, delegation, and memory tools |
 | `tools/executor.py` | Tool-call validation, permission checks, approvals, idempotency, invocation persistence, and observations |
-| `tools/workspace.py` | Workspace-relative, bounded file listing/read/range/search/write/edit operations |
-| `artifacts/service.py` | Artifact content and manifest lifecycle, checksums, versions, and scoped access |
-| `memory/service.py`, `memory/retrieval.py` | Explicit memory CRUD, ownership/sharing checks, lexical ranking, and bounded prompt context |
+| `tools/filesystem.py` | Bounded file listing/read/range/search/write/edit operations on arbitrary local paths |
+| `memory/long_term/service.py`, `memory/long_term/retrieval.py` | Explicit long-term memory CRUD, ownership/sharing checks, lexical ranking, and bounded prompt context |
+| `memory/short_term/kv.py` | Ephemeral per-run key-value memory used by agent-orchestration-core |
 | `scheduling/resources.py`, `blocking.py` | Bounded async resource queues and bounded synchronous worker pool |
-| `persistence/mongo.py` | Production MongoDB collections, indexes, transactions, event append, scheduler lease, budgets, and recovery |
-| `persistence/sqlite.py`, `migrations.py` | Local legacy/development adapter and SQLite schema migrations; not used by normal MongoDB composition |
+| `memory/backends/mongo.py` | Production MongoDB collections, indexes, transactions, event append, scheduler lease, budgets, and recovery |
+| `memory/backends/sqlite.py`, `memory/backends/migrations.py` | Local legacy/development adapter and SQLite schema migrations; not used by normal MongoDB composition |
 | `interfaces/cli.py` | Interactive/one-shot CLI, run inspection, trace, controls, approvals, recovery, and memory commands |
 
 ## A task from input to answer
@@ -72,7 +72,7 @@ Cerebrum projects.
 6. If the work is substantial, the coordinator may persist child worker tasks.
    The scheduler runs dependency-ready work within configured limits.
 7. A final answer is checked against outstanding required tools, children,
-   artifacts, and any configured JSON Schema. The run's result/status is
+   and any configured JSON Schema. The run's result/status is
    committed with events.
 
 Model output is untrusted data. It cannot grant permissions or bypass tool
@@ -80,21 +80,21 @@ authorization.
 
 ## Ollama models and routing
 
-The default Ollama configuration uses the composite `UnifiedLLM` interface:
+The default Ollama configuration uses `UnifiedLLM` with deterministic task-sensitive model selection:
 
 | Role | Model | Work |
 | --- | --- | --- |
-| Action and tool decision | `lfm2.5-thinking:1.2b` | Produces a schema-constrained answer decision or a call to one available tool |
-| Final response | `gemma3:1b` | Turns the action context and observed tool output into the user-facing answer |
+| Ordinary response and tool decision | `lfm2.5-thinking:1.2b` | Handles direct answers and schema-constrained tool selection; short answers stay on LFM |
+| Content-heavy response | `gemma3:1b` | Handles summaries, context construction, large inputs, and kernel-result synthesis |
 
 `UnifiedLLM` is the model-facing interface, but it does not execute tools. It
 returns a typed tool call to `AgentRunner`; `ToolExecutor` validates the schema,
 permissions, and approval policy, then persists and executes the operation.
-The next invocation gives the observed result back to LFM. LFM decides when the
-work is complete, and Gemma writes the final answer from the verified output.
-For a direct-answer request, LFM supplies answer context and Gemma writes the
-response without a tool call. Both internal model requests and responses are
-included in the persisted step trace.
+The next invocation gives observed results back to LFM. Short answers remain on
+LFM; Gemma is invoked only when the task is content-heavy. Direct requests use
+one selected model call, avoiding the former LFM-then-Gemma round trip for
+ordinary tasks. Internal model requests and responses remain in the persisted
+step trace.
 
 With Ollama and `routing_mode = "auto"`, the harness uses this unified tool
 flow. Clearly requested built-in file operations are independently inferred
@@ -106,14 +106,14 @@ Available modes:
 
 | Mode | Behavior |
 | --- | --- |
-| `auto` | Uses the unified LFM-action/Gemma-answer flow with Ollama; explicit required tools are enforced |
+| `auto` | Uses task-sensitive LFM/Gemma routing with Ollama; explicit required tools are enforced |
 | `router_worker` | Compatibility mode; Ollama still routes through the unified interface |
 | `chat` | Answer without tool calls |
 | `tools` | Decision/tool flow through the configured model client |
 | `two_stage` | Produce a draft, then ask the response model for a final answer |
 
-LFM output uses an Ollama JSON Schema requiring either a complete answer
-decision or a complete tool call. The CLI waits for the task to finish before
+LFM tool decisions use an Ollama JSON Schema requiring either an answer or a
+complete tool call. The CLI waits for the task to finish before
 displaying the answer; action JSON, tool arguments, and intermediate drafts are not shown.
 Interactive chat reuses the Ollama client and connection pool across prompts
 and includes the three most recent successful exchanges as follow-up context.
@@ -130,7 +130,7 @@ Delegation is appropriate for complex, multi-part, long, or context-heavy work.
 Independent subtasks can be submitted together and run concurrently. The model
 chooses whether to delegate, so a request in natural language is guidance, not a
 guarantee. Child tasks persist their objectives, dependencies, acceptance
-criteria, capabilities, handoff, artifact IDs, deadline, and idempotency key.
+criteria, capabilities, handoff, deadline, and idempotency key.
 Permissions and step limits can only narrow from the parent.
 
 Limits include up to eight children per delegation batch, bounded nesting, and
@@ -144,30 +144,26 @@ By default, required-child failures fail the parent; `partial_result_policy =
 | Tool | Purpose | Important bounds / policy |
 | --- | --- | --- |
 | `calculator` | Basic `+ - * / %` arithmetic | Bounded expression length and magnitude; no Python evaluation |
-| `list_files` | List one workspace directory | Non-recursive, bounded results; skips generated/internal locations |
-| `read_file` | Read a UTF-8 workspace file | Bounded text |
+| `list_files` | List any local directory | Non-recursive, bounded results |
+| `read_file` | Read a UTF-8 local file | Bounded text |
 | `read_file_range` | Read a selected line range | Up to 100 lines; bounded scanning and output |
-| `search_files` | Find a literal query in workspace files | Case-sensitive; bounded file scan and result count |
-| `write_file` | Write a UTF-8 workspace file | Workspace-relative paths; treated as a non-idempotent write |
+| `search_files` | Find a literal query under a local directory | Case-sensitive; bounded file scan and result count |
+| `write_file` | Write a UTF-8 local file | Absolute paths or paths relative to the process current directory; treated as a non-idempotent write |
 | `edit_file` | Replace one exact unique match | Fails if the target text is missing or ambiguous |
-| `artifact_write` | Save a task artifact and manifest | Idempotent invocation; artifacts can be read by ID |
-| `artifact_read` | Retrieve an artifact by ID | Access scoped to authorized run/task and handed-off artifact IDs |
-| `artifact_list` | List task artifacts | Scoped artifact metadata |
 | `delegate_tasks` | Create bounded worker tasks | Version 2 creates generic workers; version 1 stays available for old persisted calls |
 | `memory_save` | Save a user-scoped memory fact | Registered only when memory extraction is enabled; explicit user request required |
 
-Workspace paths are relative to the configured workspace. Traversal and
-symlink/reparse-point escapes are rejected, and file tools cannot access the
-artifact root. Reads/writes/edits are bounded to 16 KiB of text. Search scans
-at most 500 files / 2 MiB and returns at most 20 line matches. Directory
-listing is non-recursive and bounded; range reading scans at most 2 MiB and
-returns at most 12 KiB. Writes and edits can be held for approval by enabling
-`require_write_approval`.
+File tools accept absolute paths anywhere on the local filesystem. Relative
+paths resolve from the process current directory. Reads/writes/edits are bounded
+to 128 KiB of text. Search scans at most 500 files / 2 MiB and returns at most
+20 line matches. Directory listing is non-recursive and bounded; range reading
+scans at most 2 MiB and returns at most 12 KiB. Writes and edits can be held for
+approval by enabling `require_write_approval`.
 
 ## Scheduling and performance controls
 
 `TaskScheduler` fairly admits child work round-robin across runs and FIFO within
-a run. `ResourceScheduler` separately bounds model, tool, artifact, and memory
+a run. `ResourceScheduler` separately bounds model, tool, and memory
 work. The Ollama HTTP connection-pool size follows the configured provider
 concurrency. Synchronous operations use a bounded thread pool; timing out the
 wait does not claim that a running Python thread was stopped.
@@ -178,7 +174,6 @@ Default limits in `examples/ollama.toml`:
 | --- | ---: |
 | Model operations / per-provider model operations | 2 / 2 |
 | Tool operations | 4 |
-| Artifact operations | 2 |
 | Memory operations | 2 |
 | Child task operations | 4 |
 | Blocking tool workers | 2 |
@@ -199,20 +194,14 @@ backend. The standard Ollama examples use the database name `test`.
 
 | Collection | What it stores |
 | --- | --- |
-| `runs` | User-scoped run snapshot, status, model/config snapshot, result, deadline, and control intent |
-| `tasks` | Root and child task snapshots, assignment, scope, handoff, and status |
-| `task_dependencies` | Durable child dependency edges |
-| `delegations` | Idempotent parent-to-child delegation records |
-| `steps` | Model requests, accepted responses, failures, stage, and ordinal |
-| `invocations` | Tool identity/arguments, execution status, result, or error |
-| `approvals` | Approval decision tied to the exact invocation/tool version/arguments |
-| `artifacts` | Artifact identity, task/run scope, versions, and integrity manifest |
-| `events` | Ordered lifecycle and completion events |
-| `checkpoints` | Versioned execution continuation for safe recovery |
-| `budget_accounts` | Hierarchical task/run budget totals |
-| `budget_reservations` | Idempotent reservation and reconciliation records |
-| `memory_records` | Private/shared user memory, tags, provenance, and soft deletion |
-| `process_ownership` | Scheduler lease and heartbeat for a database |
+| `telemetry` | Complete typed run traces: run/task snapshots, dependencies, delegations, model steps, tool calls, approvals, lifecycle events, and recovery checkpoints |
+| `memory` | Private/shared long-term user memory, tags, provenance, and soft deletion |
+| `control` | Budget accounts/reservations and the scheduler ownership lease |
+
+Telemetry documents have a `_kind` field to distinguish record types while
+keeping each complete trace in one collection. New state uses these three
+collections. Existing per-type collections and their data are left untouched;
+a fresh database will contain only these three application collections.
 
 Transactions commit state changes and their lifecycle events together. A MongoDB
 replica-set deployment is required for transactions. The scheduler lease ensures
@@ -299,8 +288,8 @@ conservatively at the reserved amount. Retries consume additional budget.
 
 `max_total_steps`, `max_total_tokens`, and `max_total_tool_calls` set run-wide
 limits. Retries default off; bounded transient-provider retries are configurable.
-Completion checks can require named committed artifacts and a JSON Schema. A
-limited number of corrections may be requested after a failed check.
+Completion checks can enforce required phrases and a JSON Schema. A limited
+number of corrections may be requested after a failed check.
 
 ## Development
 

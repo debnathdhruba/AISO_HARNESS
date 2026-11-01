@@ -1,1 +1,1 @@
-"""Trusted registered tools, validation and durable execution."""
+"""Tool implementations, catalog, validation, and execution components."""

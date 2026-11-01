@@ -26,7 +26,6 @@ class ResourceKind(StrEnum):
     MODEL = "model"
     TOOL = "tool"
     MEMORY = "memory"
-    ARTIFACT = "artifact"
 
 
 @dataclass(frozen=True)
@@ -82,7 +81,6 @@ class ResourceScheduler:
                 ResourceKind.MODEL: ResourceLimit(2, 8, 1),
                 ResourceKind.TOOL: ResourceLimit(4, 16, 2),
                 ResourceKind.MEMORY: ResourceLimit(2, 8, 1),
-                ResourceKind.ARTIFACT: ResourceLimit(2, 8, 1),
             }
         )
         require(set(self._limits) == set(ResourceKind), "Every resource needs a queue policy")

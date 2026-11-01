@@ -17,7 +17,7 @@ CLI / HTTP -> application services -> run controller
                               bounded agent transition
                                       |
                               resource gateway
-                         model / tool / memory / artifact
+                         model / tool / memory
                                       |
                            ports -> concrete adapters
 
@@ -56,11 +56,11 @@ The runner advances one bounded decision; the coordinator owns dependencies and
 child relationships. Task admission is round-robin across runs, FIFO within runs.
 Resource admission separately bounds queues and provider/tool capacity. Waiting
 parents release task slots. Cancellation intent is distinct from confirmed stop.
-For Ollama auto mode, `llm/router.py` implements a durable Router-Worker flow:
-Gemma routes using the full task context without native tool schemas, then LFM
-generates a single selected tool call from compact routed data and that tool's
-schema. Each model request remains an independent persisted step; tool policy,
-execution, and result validation stay in the existing runner and tool executor.
+For Ollama, ordinary response requests use LFM directly; content-heavy requests
+such as summaries and kernel-result synthesis use Gemma. Tool decisions always
+use LFM and return typed calls to the existing runner and tool executor for
+authorization, persistence, execution, and result validation. Context overflow
+is handed to agent-orchestration-core for paging and parallel worker execution.
 The versioned `worker` agent definition is task-focused rather than paired with
 an individual tool. Coordinators can create bounded worker tasks through the
 factory/coordinator path; independent children run concurrently within the
@@ -70,7 +70,7 @@ Ollama responses can stream through the model gateway to the CLI; only the
 final answer is emitted, keeping tool calls and intermediate drafts private.
 The interactive CLI keeps one Ollama HTTP client open across turns, and its
 connection-pool size follows the configured provider concurrency.
-Phase 4 implements in-process model, tool, artifact and memory admission lanes:
+Phase 4 implements in-process model, tool and memory admission lanes:
 queues reject excess work explicitly, model requests are capped per provider, and
 capacity snapshots expose active and queued counts. The blocking-tool adapter
 bounds submitted thread work and retains its capacity after caller timeout until
@@ -87,15 +87,14 @@ reconciliation. A filesystem rename is not atomic with a database commit.
 Children inherit user identity, narrower capabilities and ancestor budgets.
 Reserve budget before external work, reconcile usage, and retain deadlines across
 restart/pause. Final prose is only a completion candidate: required actions,
-children, artifacts and acceptance checks must settle first. Memory sharing stays
-within the same user. Artifact access must enforce workspace and symlink bounds.
+children and acceptance checks must settle first. Memory sharing stays within
+the same user.
 
-Built-in file tools operate only under the configured workspace and cannot access
-the artifact storage root or reserved runtime data. They reject
-absolute/traversal paths and symlink/reparse-point components, use bounded
-UTF-8 text, and keep search results capped. Directory listing is non-recursive
-and bounded; range reads cap both scanned and returned bytes to reduce context
-pressure. File edits replace one exact match and fail if it is missing or
+Built-in file tools accept absolute paths anywhere on the local filesystem and
+relative paths from the process current directory. They follow explicitly
+supplied symlinks and use bounded UTF-8 operations. Search results remain capped;
+directory listing is non-recursive and bounded; range reads cap scanned and
+returned bytes. File edits replace one exact match and fail if it is missing or
 ambiguous; writes remain non-read-only effects.
 
 Known end-state limits: trusted in-process tools, single-service ownership,
@@ -117,9 +116,8 @@ execution assumptions are intentionally not carried into this project.
 | Schedule model, memory, storage, and tool requests | `aios/scheduler/base.py`, `aios/scheduler/fifo_scheduler.py`, `aios/scheduler/rr_scheduler.py` | `scheduling/resources.py:ResourceScheduler`; `agents/scheduler.py:TaskScheduler` | Separate bounded async resource admission from fair child-task scheduling. No AIOS generation time-slicing or worker-thread request queues. |
 | Create and activate agents | `aios/syscall/factory.py:AgentFactory` | `agents/factory.py:AgentRegistry` and `AgentFactory`; `application/coordinator.py` | Versioned local definitions and durable task-scoped instances; no remote marketplace loading or downloading. |
 | Dispatch tool calls | `aios/tool/manager.py:ToolManager` | `tools/registry.py:ToolRegistry` and `tools/executor.py:ToolExecutor` | Validated and authorized registered tools with persisted invocation state, approvals, and uncertain-effect reconciliation; no implicit MCP subprocess startup. |
-| Store agent artifacts | `aios/storage/storage.py:StorageManager` | `artifacts/service.py:ArtifactService`, with durable metadata in MongoDB | Workspace-scoped artifacts and manifests/checksums; not the reference LSFS/Cerebrum storage response path. |
-| Route memory operations | `aios/memory/manager.py:MemoryManager` and scheduler memory lane | `memory/service.py:MemoryService`, `memory/retrieval.py`, MongoDB `memory_records`, and `scheduling/resources.py:ResourceKind.MEMORY` | Phase 8 adds MongoDB-backed user/agent-scoped memory with deterministic lexical retrieval and a semantic-provider port; no vector database is required. |
-| Budget, completion, restart recovery, and process ownership | No direct equivalent was identified in the inspected scheduler/factory/storage/tool/memory components | MongoDB budget accounts/reservations and completion events in `persistence/mongo.py`; ownership/recovery/checkpoints in the same store; policies in `application/completion.py` | These are harness durability and safety extensions, not copied AIOS components. |
+| Route memory operations | `aios/memory/manager.py:MemoryManager` and scheduler memory lane | `memory/long_term/service.py:MemoryService`, `memory/long_term/retrieval.py`, MongoDB `memory`, and `scheduling/resources.py:ResourceKind.MEMORY` | Phase 8 adds MongoDB-backed user/agent-scoped memory with deterministic lexical retrieval and a semantic-provider port; no vector database is required. |
+| Budget, completion, restart recovery, and process ownership | No direct equivalent was identified in the inspected scheduler/factory/storage/tool/memory components | MongoDB control documents for budgets/ownership and telemetry records for completion events in `memory/backends/mongo.py`; policies in `application/completion.py` | These are harness durability and safety extensions, not copied AIOS components. |
 
 Phase mapping: Phase 4 uses the scheduler responsibilities; Phase 5 uses local
 factory/registry and task-coordination responsibilities; Phase 6 adds the

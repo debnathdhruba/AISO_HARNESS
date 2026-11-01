@@ -7,13 +7,13 @@ from typing import TypeVar
 
 from agent_harness.domain.errors import ErrorCode, HarnessError, require
 from agent_harness.domain.memory import MemoryRecord, MemorySharing
-from agent_harness.memory.retrieval import (
+from agent_harness.memory.long_term.retrieval import (
     LexicalMemoryRetriever,
     MemoryRetrievalProvider,
     render_memory_context,
 )
-from agent_harness.ports.memory import MemoryRepository
-from agent_harness.ports.state import Clock, IdGenerator
+from agent_harness.protocols.memory import MemoryRepository
+from agent_harness.protocols.state import Clock, IdGenerator
 from agent_harness.scheduling import ResourceKind, ResourceScheduler
 
 T = TypeVar("T")

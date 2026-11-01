@@ -73,7 +73,7 @@ in the Phase 7 review. No new test files were added.
 ## Files and contracts
 
 - `domain/memory.py`: `MemoryRecord`, `MemorySharing`.
-- `ports/memory.py`: `MemoryRepository`.
+- `protocols/memory.py`: `MemoryRepository`.
 - `memory/retrieval.py`: `MemoryRetrievalProvider`, lexical ranking, context rendering.
 - `memory/service.py`: CRUD, scope enforcement, retrieval budgets.
 - `persistence/mongo.py`: MongoDB encoding, validation, scoped queries and indexes.

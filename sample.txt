@@ -11,8 +11,8 @@ Getting started
 
 Research and reasoning
 ----------------------
-5. Find the resource scheduling defaults. List the model, tool, artifact, and
-   memory capacities, and calculate their total.
+5. Find the resource scheduling defaults. List the model, tool, and memory
+   capacities, and calculate their total.
 6. Find the tool safety limits and model concurrency settings. Return each
    value with its source file.
 7. Explain how a task moves from the CLI to the model and then to a tool. Use

@@ -16,7 +16,7 @@ execute tools; action responses fail explicitly. Default retries/corrections are
 zero. Run deadlines persist across continuation, both stages consume steps, and
 final answers report verified=false. Model thinking traces are discarded.
 
-Files: domain/model.py, ports/model.py, application/runs.py, agents/runner.py,
+Files: domain/model.py, protocols/model.py, application/runs.py, agents/runner.py,
 models/{context,codec,gateway}.py, adapters/{fake,ollama}.py, config.py, bootstrap.py,
 interfaces/cli.py; updates to state ports, SQLite, migrations and packaging;
 examples/ollama.toml; tests/test_phase2.py and tests/test_ollama.py plus updated

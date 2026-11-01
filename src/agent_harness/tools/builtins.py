@@ -1,17 +1,23 @@
-import ast
-import json
-import math
-import operator
-from collections.abc import Awaitable, Callable
-from pathlib import Path
+"""Contracts and dependency wiring for the built-in tool catalog."""
 
-from agent_harness.artifacts.service import ArtifactService
+import json
+
 from agent_harness.domain.entities import JsonObject
-from agent_harness.domain.errors import require
 from agent_harness.domain.memory import MemorySharing
-from agent_harness.domain.tooling import Effect, Invocation, ToolSpec
-from agent_harness.tools.registry import RegisteredTool, ToolRegistry
-from agent_harness.tools.workspace import WorkspaceFileService
+from agent_harness.domain.tooling import Effect, ToolSpec
+from agent_harness.tools.filesystem import FileSystemService
+from agent_harness.tools.registry import Handler, RegisteredTool, ToolRegistry
+from agent_harness.tools.tools import (
+    CalculatorTool,
+    CallbackTool,
+    EditFileTool,
+    ListFilesTool,
+    ReadFileRangeTool,
+    ReadFileTool,
+    SearchFilesTool,
+    WriteFileTool,
+    calculate,
+)
 
 
 def schema(properties: dict[str, object], required: list[str]) -> JsonObject:
@@ -38,16 +44,15 @@ def delegation_schema(agent_profiles: tuple[str, ...]) -> JsonObject:
                     "type": "object",
                     "properties": {
                         "alias": {"type": "string", "minLength": 1, "maxLength": 64},
-                        "idempotency_key": {"type": "string", "minLength": 1, "maxLength": 200},
+                        "idempotency_key": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 200,
+                        },
                         "agent_definition_id": {"type": "string", "enum": list(agent_profiles)},
                         "agent_version": {"type": "string", "maxLength": 20},
                         "objective": {"type": "string", "minLength": 1, "maxLength": 4096},
                         "acceptance_criteria": {"type": "object"},
-                        "input_artifact_ids": {
-                            "type": "array",
-                            "items": {"type": "string", "maxLength": 64},
-                            "maxItems": 16,
-                        },
                         "dependencies": {
                             "type": "array",
                             "items": {"type": "string", "maxLength": 64},
@@ -74,105 +79,14 @@ def delegation_schema(agent_profiles: tuple[str, ...]) -> JsonObject:
     )
 
 
-def calculate(expression: str) -> int | float:
-    require(len(expression) <= 200, "Calculator expression too long")
-    try:
-        node = ast.parse(expression, mode="eval")
-    except SyntaxError:
-        require(False, "Invalid arithmetic expression")
-        raise AssertionError("unreachable") from None
-    require(len(list(ast.walk(node))) <= 64, "Calculator expression too complex")
-    operations: dict[type[ast.operator], Callable[[float, float], float]] = {
-        ast.Add: operator.add,
-        ast.Sub: operator.sub,
-        ast.Mult: operator.mul,
-        ast.Div: operator.truediv,
-        ast.Mod: operator.mod,
-    }
-
-    def evaluate(value: ast.AST) -> float:
-        if isinstance(value, ast.Constant) and type(value.value) in {int, float}:
-            assert isinstance(value.value, (int, float))
-            result = float(value.value)
-        elif isinstance(value, ast.UnaryOp) and isinstance(value.op, (ast.UAdd, ast.USub)):
-            result = evaluate(value.operand) * (-1 if isinstance(value.op, ast.USub) else 1)
-        elif isinstance(value, ast.BinOp) and type(value.op) in operations:
-            result = operations[type(value.op)](evaluate(value.left), evaluate(value.right))
-        else:
-            require(False, "Only bounded basic arithmetic is supported")
-            raise AssertionError("unreachable")
-        require(math.isfinite(result) and abs(result) <= 1e12, "Calculator magnitude exceeds limit")
-        return result
-
-    try:
-        result = evaluate(node.body)
-    except (ZeroDivisionError, OverflowError):
-        require(False, "Invalid arithmetic operation")
-        raise AssertionError("unreachable") from None
-    return int(result) if result.is_integer() else result
-
-
 def builtin_registry(
-    artifacts: ArtifactService,
-    workspace: Path,
-    artifact_root: Path,
-    delegate: Callable[[Invocation], Awaitable[JsonObject]] | None = None,
-    memory_save: Callable[[Invocation], Awaitable[JsonObject]] | None = None,
+    delegate: Handler | None = None,
+    memory_save: Handler | None = None,
 ) -> ToolRegistry:
+    """Build the application catalog by injecting services into tool handlers."""
     text = {"type": "string", "maxLength": 4096}
     output = JsonObject('{"type":"object"}')
-    files = WorkspaceFileService(workspace, artifact_root)
-
-    async def calculator(invocation: Invocation) -> JsonObject:
-        args = json.loads(invocation.arguments.text)
-        return JsonObject(json.dumps({"value": calculate(args["expression"])}))
-
-    async def write(invocation: Invocation) -> JsonObject:
-        args = json.loads(invocation.arguments.text)
-        return await artifacts.write(invocation, args["name"], args["content"])
-
-    async def read(invocation: Invocation) -> JsonObject:
-        return await artifacts.read(
-            invocation, json.loads(invocation.arguments.text)["artifact_id"]
-        )
-
-    async def listing(invocation: Invocation) -> JsonObject:
-        return await artifacts.list(invocation)
-
-    async def read_file(invocation: Invocation) -> JsonObject:
-        args = json.loads(invocation.arguments.text)
-        return await files.read(invocation, args["path"])
-
-    async def read_file_range(invocation: Invocation) -> JsonObject:
-        args = json.loads(invocation.arguments.text)
-        return files.read_range(args["path"], args["start_line"], args["line_count"])
-
-    async def list_files(invocation: Invocation) -> JsonObject:
-        args = json.loads(invocation.arguments.text)
-        return files.list_files(
-            args["directory"],
-            args.get("pattern", "*"),
-            args.get("limit", 100),
-        )
-
-    async def write_file(invocation: Invocation) -> JsonObject:
-        args = json.loads(invocation.arguments.text)
-        return await files.write(invocation, args["path"], args["content"])
-
-    async def search_files(invocation: Invocation) -> JsonObject:
-        args = json.loads(invocation.arguments.text)
-        return await files.search(args["query"], args["pattern"])
-
-    async def edit_file(invocation: Invocation) -> JsonObject:
-        args = json.loads(invocation.arguments.text)
-        return await files.edit(invocation, args["path"], args["old_text"], args["new_text"])
-
-    async def save_memory(invocation: Invocation) -> JsonObject:
-        callback = memory_save
-        if callback is None:
-            require(False, "Memory extraction is not enabled")
-            raise AssertionError("unreachable")
-        return await callback(invocation)
+    files = FileSystemService()
 
     tools = [
         RegisteredTool(
@@ -183,43 +97,13 @@ def builtin_registry(
                 schema({"expression": {"type": "string", "maxLength": 200}}, ["expression"]),
                 output,
             ),
-            calculator,
-        ),
-        RegisteredTool(
-            ToolSpec(
-                "artifact_write",
-                "1",
-                "Write a bounded text artifact in this task.",
-                schema(
-                    {"name": {"type": "string", "maxLength": 100}, "content": text},
-                    ["name", "content"],
-                ),
-                output,
-                effect=Effect.IDEMPOTENT_WRITE,
-                idempotency="invocation_id",
-                supports_reconciliation=True,
-            ),
-            write,
-        ),
-        RegisteredTool(
-            ToolSpec(
-                "artifact_read",
-                "1",
-                "Read an artifact by its returned ID.",
-                schema({"artifact_id": {"type": "string"}}, ["artifact_id"]),
-                output,
-            ),
-            read,
-        ),
-        RegisteredTool(
-            ToolSpec("artifact_list", "1", "List artifacts in this task.", schema({}, []), output),
-            listing,
+            CalculatorTool(),
         ),
         RegisteredTool(
             ToolSpec(
                 "read_file_range",
                 "1",
-                "Read a bounded line range from a UTF-8 workspace file. Use this instead of "
+                "Read a bounded line range from a UTF-8 local file. Use this instead of "
                 "reading an entire large file when only part is relevant.",
                 schema(
                     {
@@ -232,14 +116,15 @@ def builtin_registry(
                 output,
                 max_output_bytes=32_768,
             ),
-            read_file_range,
+            ReadFileRangeTool(files),
         ),
         RegisteredTool(
             ToolSpec(
                 "list_files",
                 "1",
-                "List bounded files and directories directly inside a workspace directory. "
-                "Use '.' for the workspace root; this does not recurse.",
+                "List bounded files and directories directly inside any local directory. "
+                "Use an absolute path or a path relative to the current directory; this does "
+                "not recurse.",
                 schema(
                     {
                         "directory": {"type": "string", "maxLength": 512},
@@ -249,42 +134,45 @@ def builtin_registry(
                             "maxLength": 200,
                             "default": "*",
                         },
-                        "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 100},
+                        "limit": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 200,
+                            "default": 100,
+                        },
                     },
                     ["directory"],
                 ),
                 output,
                 max_output_bytes=32_768,
             ),
-            list_files,
+            ListFilesTool(files),
         ),
         RegisteredTool(
             ToolSpec(
                 "read_file",
                 "1",
-                "Read a bounded UTF-8 text file inside the configured workspace.",
+                "Read a bounded UTF-8 text file at an absolute path or relative to the current "
+                "directory.",
                 schema({"path": {"type": "string", "maxLength": 512}}, ["path"]),
                 output,
                 max_output_bytes=65_536,
             ),
-            read_file,
+            ReadFileTool(files),
         ),
         RegisteredTool(
             ToolSpec(
                 "write_file",
                 "1",
-                "Write bounded UTF-8 text to a file inside the configured workspace.",
+                "Write bounded UTF-8 text to any local file path.",
                 schema(
-                    {
-                        "path": {"type": "string", "maxLength": 512},
-                        "content": text,
-                    },
+                    {"path": {"type": "string", "maxLength": 512}, "content": text},
                     ["path", "content"],
                 ),
                 output,
                 effect=Effect.NON_IDEMPOTENT_WRITE,
             ),
-            write_file,
+            WriteFileTool(files),
         ),
         RegisteredTool(
             ToolSpec(
@@ -295,19 +183,20 @@ def builtin_registry(
                     {
                         "query": {"type": "string", "minLength": 1, "maxLength": 512},
                         "pattern": {"type": "string", "maxLength": 200},
+                        "path": {"type": "string", "maxLength": 1024, "default": "."},
                     },
                     ["query", "pattern"],
                 ),
                 output,
                 max_output_bytes=32_768,
             ),
-            search_files,
+            SearchFilesTool(files),
         ),
         RegisteredTool(
             ToolSpec(
                 "edit_file",
                 "1",
-                "Replace one exact, unique text match in a workspace file.",
+                "Replace one exact, unique text match in a local file.",
                 schema(
                     {
                         "path": {"type": "string", "maxLength": 512},
@@ -319,10 +208,12 @@ def builtin_registry(
                 output,
                 effect=Effect.NON_IDEMPOTENT_WRITE,
             ),
-            edit_file,
+            EditFileTool(files),
         ),
     ]
+
     if delegate is not None:
+        handler = CallbackTool(delegate)
         tools.extend(
             (
                 RegisteredTool(
@@ -337,7 +228,7 @@ def builtin_registry(
                         idempotency="invocation_id",
                         supports_reconciliation=True,
                     ),
-                    delegate,
+                    handler,
                 ),
                 RegisteredTool(
                     ToolSpec(
@@ -353,10 +244,11 @@ def builtin_registry(
                         idempotency="invocation_id",
                         supports_reconciliation=True,
                     ),
-                    delegate,
+                    handler,
                 ),
             )
         )
+
     if memory_save is not None:
         tools.append(
             RegisteredTool(
@@ -386,7 +278,11 @@ def builtin_registry(
                     idempotency="invocation_id",
                     supports_reconciliation=True,
                 ),
-                save_memory,
+                CallbackTool(memory_save),
             )
         )
+
     return ToolRegistry(tuple(tools))
+
+
+__all__ = ("builtin_registry", "calculate", "schema")

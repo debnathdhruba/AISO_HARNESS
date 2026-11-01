@@ -8,8 +8,8 @@ from agent_harness.application.runs import RunService
 from agent_harness.domain.entities import JsonObject
 from agent_harness.domain.model import FinishReason, Message, ModelResponse, Role, RunOptions
 from agent_harness.domain.states import RunStatus
+from agent_harness.memory.backends.sqlite import SQLiteStore
 from agent_harness.models.gateway import ModelGateway
-from agent_harness.persistence.sqlite import SQLiteStore
 
 
 @pytest.mark.parametrize(
@@ -22,7 +22,7 @@ from agent_harness.persistence.sqlite import SQLiteStore
         ("Please save this in answer.txt", "tools"),
         ("Search files for an import in the workspace", "tools"),
         ("Edit file src/example.py", "tools"),
-        ("artifact demo", "tools"),
+        ("Read implementation.md", "tools"),
     ],
 )
 def test_auto_routing(task: str, expected: str) -> None:
@@ -34,10 +34,20 @@ def test_override_and_legacy_snapshots() -> None:
     assert select_mode("Hello", RunOptions(routing_mode="tools")) == "tools"
     assert select_mode("Hello", RunOptions(required_tools=("calculator",))) == "tools"
     assert RunOptions.restore(JsonObject()).routing_mode == "two_stage"
-    assert RunOptions().workspace == "."
-    assert RunOptions().artifact_root == ".local/artifacts"
-    legacy = RunOptions.restore(JsonObject('{"workspace":"legacy-artifact-root"}'))
-    assert legacy.artifact_root == "legacy-artifact-root"
+    legacy = RunOptions.restore(
+        JsonObject(
+            '{"workspace":"legacy-root","artifact_root":"legacy-root",'
+            '"tool_allowlist":["artifact_read","read_file"],'
+            '"required_tools":["artifact_read"]}'
+        )
+    )
+    assert legacy.tool_allowlist == ("read_file",)
+    assert legacy.required_tools == ()
+
+
+def test_ollama_auto_keeps_greetings_on_the_fast_chat_path() -> None:
+    assert select_mode("hi", RunOptions(provider="ollama")) == "chat"
+    assert select_mode("Calculate 6*7", RunOptions(provider="ollama")) == "tools"
 
 
 @pytest.mark.asyncio

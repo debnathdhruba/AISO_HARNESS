@@ -31,9 +31,6 @@ class Settings(BaseModel):
     max_input_bytes: int = Field(default=16384, ge=256, le=131072)
     tool_allowlist: tuple[str, ...] = (
         "calculator",
-        "artifact_write",
-        "artifact_read",
-        "artifact_list",
         "list_files",
         "read_file",
         "read_file_range",
@@ -45,8 +42,6 @@ class Settings(BaseModel):
     max_tool_calls: int = Field(default=8, ge=1, le=100)
     repeated_action_limit: int = Field(default=2, ge=1, le=10)
     require_write_approval: bool = False
-    workspace: str = "."
-    artifact_root: str = ".local/artifacts"
     required_tools: tuple[str, ...] = ()
     routing_mode: Literal["auto", "chat", "tools", "two_stage", "router_worker"] = "auto"
     response_max_tokens: int = -1
@@ -57,19 +52,18 @@ class Settings(BaseModel):
     max_retries: int = Field(default=0, ge=0, le=3)
     max_corrections: int = Field(default=1, ge=0, le=3)
     partial_result_policy: Literal["fail", "allow"] = "fail"
-    required_artifacts: tuple[str, ...] = ()
     result_schema: dict[str, object] = Field(default_factory=dict)
     memory_retrieval_enabled: bool = False
     memory_extraction_enabled: bool = False
     memory_retrieval_limit: int = Field(default=5, ge=1, le=20)
     memory_context_bytes: int = Field(default=2048, ge=128, le=16384)
+    auto_kernel_enabled: bool = True
+    auto_kernel_trigger_bytes: int = Field(default=8192, ge=1024, le=131072)
     model_concurrency: int = Field(default=2, ge=1, le=32)
     model_queue_capacity: int = Field(default=8, ge=0, le=1024)
     model_provider_concurrency: int = Field(default=2, ge=1, le=32)
     tool_concurrency: int = Field(default=4, ge=1, le=64)
     tool_queue_capacity: int = Field(default=16, ge=0, le=1024)
-    artifact_concurrency: int = Field(default=2, ge=1, le=32)
-    artifact_queue_capacity: int = Field(default=8, ge=0, le=1024)
     memory_concurrency: int = Field(default=2, ge=1, le=32)
     memory_queue_capacity: int = Field(default=8, ge=0, le=1024)
     blocking_tool_workers: int = Field(default=2, ge=1, le=32)
@@ -122,8 +116,6 @@ class Settings(BaseModel):
                     "model_provider_concurrency",
                     "tool_concurrency",
                     "tool_queue_capacity",
-                    "artifact_concurrency",
-                    "artifact_queue_capacity",
                     "memory_concurrency",
                     "memory_queue_capacity",
                     "blocking_tool_workers",

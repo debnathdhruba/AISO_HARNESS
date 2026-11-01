@@ -92,10 +92,8 @@ class AgentFactory:
 
 def local_agent_registry() -> AgentRegistry:
     file_tools = ("list_files", "read_file", "read_file_range", "search_files")
-    artifacts = ("artifact_write", "artifact_read", "artifact_list")
     worker_capabilities = (
         "calculator",
-        *artifacts,
         *file_tools,
         "write_file",
         "edit_file",
@@ -128,21 +126,25 @@ def local_agent_registry() -> AgentRegistry:
                 "1",
                 worker_capabilities,
                 "Complete the explicit bounded subtask using only the supplied handoff and "
-                "authorized capabilities. Return concise findings with file paths or artifact IDs "
-                "when available. Do not delegate further.",
+                "authorized capabilities. Return concise findings with relevant file paths "
+                "when available. The kernel may subdivide this task if its context overflows.",
+                may_delegate=True,
+                max_children=8,
+                max_active_children=4,
+                max_depth=2,
             ),
             AgentDefinition(
                 "researcher",
                 "1",
-                ("calculator", *artifacts, *file_tools, "memory_save"),
-                "Research only the supplied workspace and task handoff. Return concise findings "
-                "and cite file paths or artifact IDs when available.",
+                ("calculator", *file_tools, "write_file", "edit_file", "memory_save"),
+                "Research using the supplied task handoff and authorized local filesystem tools. "
+                "Return concise findings and cite relevant file paths when available.",
             ),
             AgentDefinition(
                 "writer",
                 "1",
-                ("calculator", *artifacts, "memory_save"),
-                "Produce the requested artifact from the explicit task handoff. Do not invent "
+                ("calculator", *file_tools, "write_file", "edit_file", "memory_save"),
+                "Produce the requested output from the explicit task handoff. Do not invent "
                 "unprovided research.",
             ),
         )

@@ -8,7 +8,6 @@ from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError
 
 from agent_harness.domain.entities import JsonObject, Task
-from agent_harness.domain.tooling import ArtifactRecord
 
 
 @dataclass(frozen=True)
@@ -32,7 +31,6 @@ class CompletionDecision:
 def validate_completion(
     task: Task,
     result: JsonObject,
-    artifacts: tuple[ArtifactRecord, ...],
     *,
     unresolved_tools: bool,
     pending_required_children: bool,
@@ -51,19 +49,6 @@ def validate_completion(
         reasons.append("run cancellation is requested")
     if expired:
         reasons.append("run deadline has expired")
-
-    required_artifacts = criteria.get("required_artifacts", ())
-    if not isinstance(required_artifacts, list | tuple):
-        reasons.append("required_artifacts must be a list of names")
-        required_artifacts = ()
-    committed = {
-        item.name
-        for item in artifacts
-        if item.task_id == task.task_id and item.status == "committed"
-    }
-    for name in required_artifacts:
-        if not isinstance(name, str) or name not in committed:
-            reasons.append(f"required artifact is missing: {name}")
 
     answer = candidate.get("answer")
     if isinstance(answer, str):
@@ -97,5 +82,5 @@ def validate_completion(
                 reasons.append("configured result schema is invalid")
 
     passed = not reasons
-    deterministic = bool(required_artifacts or criteria.get("required_phrases") or schema)
+    deterministic = bool(criteria.get("required_phrases") or schema)
     return CompletionDecision(passed, passed and deterministic, tuple(reasons))
