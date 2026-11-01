@@ -15,7 +15,6 @@ from agent_harness.domain.memory import MemoryRecord, MemorySharing
 from agent_harness.domain.model import RunOptions
 from agent_harness.domain.states import ControlIntent, RunStatus
 from agent_harness.models.codec import encode_step
-from agent_harness.ports.model import TokenCallback
 from agent_harness.tools.executor import decide_approval
 
 app = typer.Typer(no_args_is_help=True, help="Standalone agent harness: offline or local Ollama.")
@@ -60,7 +59,6 @@ async def execute(
     user: str,
     task: str | None,
     run_id: str | None,
-    on_token: TokenCallback | None = None,
 ) -> Run:
     async with application(settings, own_scheduler=True) as services:
         if run_id is None:
@@ -80,7 +78,7 @@ async def execute(
         }:
             return run
         async with runner(services, settings, RunOptions.restore(run.config.model)) as agent:
-            return await agent.execute(user, run.run_id, on_token=on_token)
+            return await agent.execute(user, run.run_id)
 
 
 @app.command("run")
@@ -110,20 +108,7 @@ def run_command(
         workspace=workspace,
         routing_mode=mode,
     )
-    streamed = False
-
-    async def stream_token(token: str) -> None:
-        nonlocal streamed
-        if not streamed:
-            typer.echo("Agent> ", nl=False, err=True)
-            streamed = True
-        typer.echo(token, nl=False, err=True)
-
-    result = asyncio.run(
-        execute(settings, user, task, None, stream_token if settings.provider == "ollama" else None)
-    )
-    if streamed:
-        typer.echo(err=True)
+    result = asyncio.run(execute(settings, user, task, None))
     typer.echo(json.dumps(summary(result), indent=2))
     if result.status != RunStatus.COMPLETED:
         raise typer.Exit(1)
@@ -133,10 +118,11 @@ async def chat(settings: Settings, user: str) -> None:
     async with application(settings, own_scheduler=True) as services:
         typer.echo("Agent ready. Enter a task; type 'exit' or press Ctrl+C to stop.")
         options = settings.run_options()
+        conversation: list[tuple[str, str]] = []
         async with runner(services, settings, options) as agent:
             while True:
                 try:
-                    task = input("\nYou> ").strip()
+                    task = (await asyncio.to_thread(input, "\nYou> ")).strip()
                 except EOFError:
                     break
 
@@ -146,47 +132,31 @@ async def chat(settings: Settings, user: str) -> None:
                     continue
 
                 try:
-                    run = await services.runs.submit(user, task, options)
-                    typer.echo(f"run_id={run.run_id}", err=True)
-                    streamed = False
-
-                    async def stream_token(token: str) -> None:
-                        nonlocal streamed
-                        if not streamed:
-                            typer.echo("Agent> ", nl=False)
-                            streamed = True
-                        typer.echo(token, nl=False)
-
-                    result = await agent.execute(
-                        user,
-                        run.run_id,
-                        on_token=(stream_token if settings.provider == "ollama" else None),
+                    context = "\n\n".join(
+                        f"User: {previous_task}\nAgent: {previous_answer}"
+                        for previous_task, previous_answer in conversation[-3:]
                     )
-                    if streamed:
-                        typer.echo()
-                        if result.status != RunStatus.COMPLETED:
-                            typer.echo(f"Run status: {result.status.value}", err=True)
+                    run = await services.runs.submit(
+                        user, task, options, conversation_context=context or None
+                    )
+                    typer.echo(f"run_id={run.run_id}", err=True)
+                    result = await agent.execute(user, run.run_id)
+                    if result.status == RunStatus.COMPLETED and result.result is not None:
+                        answer = json.loads(result.result.text).get("answer")
+                        if isinstance(answer, str):
+                            typer.echo("Agent> " + answer)
+                            conversation.append((task, answer))
+                        else:
+                            typer.echo(
+                                "Agent> " + json.dumps(json.loads(result.result.text), indent=2)
+                            )
+                    else:
+                        typer.echo(f"Run status: {result.status.value}")
                         if result.error is not None:
                             typer.echo(
                                 f"Task failed: {json.loads(result.error.text)['message']}",
                                 err=True,
                             )
-                    else:
-                        typer.echo(
-                            "Agent> "
-                            + json.dumps(
-                                {
-                                    "status": result.status.value,
-                                    "result": (
-                                        json.loads(result.result.text) if result.result else None
-                                    ),
-                                    "error": (
-                                        json.loads(result.error.text) if result.error else None
-                                    ),
-                                },
-                                indent=2,
-                            )
-                        )
                 except HarnessError as error:
                     typer.echo(f"Task failed: {error.message}", err=True)
 

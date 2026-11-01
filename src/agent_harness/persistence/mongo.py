@@ -434,7 +434,6 @@ class MongoStore:
                         {
                             "_id": OWNERSHIP_LEASE_ID,
                             "owner_id": owner_id,
-                            "expires_at": {"$gt": now},
                         },
                         {
                             "$set": {
@@ -455,18 +454,23 @@ class MongoStore:
         require(owner_id is not None, "This process does not own the agent scheduler")
         require(not self._scheduler_lease_lost.is_set(), "Scheduler ownership lease was lost")
         now = self._clock.utc_now()
+        # Expiration permits takeover; matching owner_id prevents a stale owner renewing afterward.
         try:
-            lease = await self._database["process_ownership"].find_one(
+            result = await self._database["process_ownership"].update_one(
                 {
                     "_id": OWNERSHIP_LEASE_ID,
                     "owner_id": owner_id,
-                    "expires_at": {"$gt": now},
                 },
-                projection={"_id": 1},
+                {
+                    "$set": {
+                        "heartbeat_at": now,
+                        "expires_at": now + timedelta(seconds=OWNERSHIP_LEASE_SECONDS),
+                    }
+                },
             )
         except PyMongoError:
             raise HarnessError(ErrorCode.STORAGE, "Cannot verify scheduler ownership") from None
-        require(lease is not None, "Scheduler ownership lease was lost")
+        require(result.matched_count == 1, "Scheduler ownership lease was lost")
 
     async def recover_startup(self) -> None:
         require(
@@ -673,7 +677,6 @@ class MongoTransaction:
             {
                 "_id": OWNERSHIP_LEASE_ID,
                 "owner_id": owner_id,
-                "expires_at": {"$gt": now},
             },
             {
                 "$set": {

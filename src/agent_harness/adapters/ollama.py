@@ -62,6 +62,31 @@ class ChatChunkPayload(BaseModel):
     eval_count: int | None = Field(default=None, ge=0)
 
 
+ROUTER_OUTPUT_SCHEMA: dict[str, object] = {
+    "oneOf": [
+        {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "const": "answer"},
+                "answer": {"type": "string", "minLength": 1, "maxLength": 8192},
+            },
+            "required": ["action", "answer"],
+            "additionalProperties": False,
+        },
+        {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "const": "tool"},
+                "tool": {"type": "string", "minLength": 1},
+                "context": {"type": "string", "minLength": 1, "maxLength": 8192},
+            },
+            "required": ["action", "tool", "context"],
+            "additionalProperties": False,
+        },
+    ]
+}
+
+
 class OllamaClient:
     def __init__(
         self,
@@ -277,7 +302,13 @@ class OllamaClient:
                 for spec in request.tools
             ]
         return {
-            **({"format": "json"} if request.json_mode else {}),
+            **(
+                {"format": json.loads(request.json_schema.text)}
+                if request.json_schema is not None
+                else {"format": ROUTER_OUTPUT_SCHEMA}
+                if request.json_mode
+                else {}
+            ),
             "model": request.model,
             "messages": messages,
             **extra,
@@ -288,7 +319,11 @@ class OllamaClient:
                     2048,
                     size(request.messages)
                     + tool_schema_size(request.tools)
-                    + request.max_output_tokens
+                    + (
+                        request.max_output_tokens
+                        if request.max_output_tokens > 0
+                        else max(size(request.messages), 8192)
+                    )
                     + 512,
                 ),
             },

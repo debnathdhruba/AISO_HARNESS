@@ -57,6 +57,8 @@ def decode_step(text: str) -> Step:
             request["max_output_tokens"],
             tuple(tools),
             request.get("json_mode", False),
+            JsonObject(**request["json_schema"]) if request.get("json_schema") else None,
+            tuple(request.get("required_tools", ())),
         )
         response = data["response"]
         if response is not None:
@@ -64,6 +66,7 @@ def decode_step(text: str) -> Step:
                 decode_message(response["message"]),
                 FinishReason(response["finish_reason"]),
                 Usage(**response["usage"]),
+                tuple(JsonObject(**item) for item in response.get("raw_trace", ())),
             )
         if data["error"] is not None:
             data["error"] = JsonObject(**data["error"])

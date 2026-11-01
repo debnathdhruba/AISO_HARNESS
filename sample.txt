@@ -1,0 +1,47 @@
+Sample Tasks for the Agent
+==========================
+
+Getting started
+---------------
+1. Explain what a queue is in one sentence.
+2. List the files in the workspace root.
+3. Read lines 1–30 of README.md and summarize them.
+4. Find where model_provider_concurrency is configured. Explain what it
+   controls and cite the source file.
+
+Research and reasoning
+----------------------
+5. Find the resource scheduling defaults. List the model, tool, artifact, and
+   memory capacities, and calculate their total.
+6. Find the tool safety limits and model concurrency settings. Return each
+   value with its source file.
+7. Explain how a task moves from the CLI to the model and then to a tool. Use
+   the actual source code, not just the docs.
+8. Compare the README's description of streaming with the implementation.
+   Report any mismatch, or say you found none.
+
+Delegation and larger tasks
+---------------------------
+9. In parallel, find the MongoDB collections used for task state and the
+   limits used by the scheduler. Return the results with source files.
+10. Trace how a child task is created, scheduled, and its result returned to
+    the parent. Summarize the steps and cite the relevant files.
+11. Review the project documentation for inconsistencies. Report only
+    specific issues, with file and section references; don't edit anything.
+
+Writing and editing
+-------------------
+12. Create queue-notes.txt with a two-sentence explanation of FIFO, then read
+    it back.
+13. Improve the "Get started" section of README.md for a new Windows user.
+    Keep the existing commands accurate, show me the proposed changes, and
+    wait for approval before writing.
+14. Find one outdated command in the documentation, verify the correct
+    command from the project, and propose a minimal fix. Don't change files.
+
+Persistence and run inspection
+------------------------------
+15. Inspect the latest run and summarize its status, model steps, tool calls,
+    and child tasks.
+16. Show the trace for this run and summarize the tool activity. Don't repeat
+    private prompts or credentials.

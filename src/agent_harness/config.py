@@ -27,7 +27,7 @@ class Settings(BaseModel):
     response_model: str = Field(default="gemma3:1b", min_length=1)
     max_steps: int = Field(default=8, ge=1, le=100)
     timeout_seconds: int = Field(default=180, ge=1, le=3600)
-    max_output_tokens: int = Field(default=1024, ge=1, le=8192)
+    max_output_tokens: int = -1
     max_input_bytes: int = Field(default=16384, ge=256, le=131072)
     tool_allowlist: tuple[str, ...] = (
         "calculator",
@@ -49,7 +49,7 @@ class Settings(BaseModel):
     artifact_root: str = ".local/artifacts"
     required_tools: tuple[str, ...] = ()
     routing_mode: Literal["auto", "chat", "tools", "two_stage", "router_worker"] = "auto"
-    response_max_tokens: int = Field(default=512, ge=1, le=8192)
+    response_max_tokens: int = -1
     max_total_steps: int = Field(default=256, ge=1, le=4096)
     max_total_tokens: int = Field(default=262144, ge=1, le=10_000_000)
     max_total_tool_calls: int = Field(default=128, ge=1, le=4096)
@@ -90,6 +90,13 @@ class Settings(BaseModel):
     def valid_database_name(cls, value: str) -> str:
         if not re.fullmatch(r"[A-Za-z0-9_-]{1,63}", value):
             raise ValueError("MongoDB database name contains unsupported characters")
+        return value
+
+    @field_validator("max_output_tokens", "response_max_tokens")
+    @classmethod
+    def valid_output_tokens(cls, value: int) -> int:
+        if value == 0 or value < -1:
+            raise ValueError("Output token setting must be positive or -1 for no per-request cap")
         return value
 
     @field_validator("result_schema")

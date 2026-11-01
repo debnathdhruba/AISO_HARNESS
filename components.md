@@ -17,7 +17,7 @@ Cerebrum projects.
 | Ports | Interfaces for models, persistence, and memory | `ports/` |
 | Application | Run submission, route selection, completion validation, delegation | `application/` |
 | Agent runtime | Agent definitions, per-task runner, child-task scheduler | `agents/` |
-| Model orchestration | Context sizing, model gateway, Router-Worker pipeline | `models/`, `llm/` |
+| Model orchestration | Context sizing, model gateway, unified LFM-action/Gemma-answer adapter | `models/`, `llm/` |
 | Tools and artifacts | Tool registration/execution, workspace restrictions, artifact service | `tools/`, `artifacts/` |
 | Scheduling | Bounded resource queues and bounded synchronous work | `scheduling/` |
 | Persistence | MongoDB production state and SQLite development/legacy adapter | `persistence/` |
@@ -41,8 +41,9 @@ Cerebrum projects.
 | `agents/scheduler.py` | Fair, bounded admission for runnable delegated tasks |
 | `models/gateway.py` | Applies shared model-resource admission and checks normalized response types |
 | `models/context.py`, `models/codec.py` | Bound and group model context; serialize persisted steps |
-| `llm/router.py` | Parse route decisions, prepare compact tool handoffs, and stream only answer text from JSON |
-| `adapters/ollama.py` | Local Ollama HTTP client, model capability discovery, non-streaming and NDJSON streaming response normalization |
+| `llm/router.py` | Parse route decisions, prepare compact tool handoffs, and safely extract answer text from JSON |
+| `llm/unified.py` | Expose one Ollama model interface; use LFM for structured action decisions and Gemma for final answers |
+| `adapters/ollama.py` | Local Ollama HTTP client, model capability discovery, and response normalization |
 | `adapters/fake.py`, `adapters/system.py` | Deterministic offline model and injected clock/UUID implementations |
 | `tools/registry.py`, `builtins.py` | Versioned tool schemas/handlers and registration of built-in workspace, artifact, calculator, delegation, and memory tools |
 | `tools/executor.py` | Tool-call validation, permission checks, approvals, idempotency, invocation persistence, and observations |
@@ -52,7 +53,7 @@ Cerebrum projects.
 | `scheduling/resources.py`, `blocking.py` | Bounded async resource queues and bounded synchronous worker pool |
 | `persistence/mongo.py` | Production MongoDB collections, indexes, transactions, event append, scheduler lease, budgets, and recovery |
 | `persistence/sqlite.py`, `migrations.py` | Local legacy/development adapter and SQLite schema migrations; not used by normal MongoDB composition |
-| `interfaces/cli.py` | Interactive/one-shot CLI, streaming presentation, run inspection, trace, controls, approvals, recovery, and memory commands |
+| `interfaces/cli.py` | Interactive/one-shot CLI, run inspection, trace, controls, approvals, recovery, and memory commands |
 
 ## A task from input to answer
 
@@ -79,33 +80,43 @@ authorization.
 
 ## Ollama models and routing
 
-The default Ollama configuration uses:
+The default Ollama configuration uses the composite `UnifiedLLM` interface:
 
 | Role | Model | Work |
 | --- | --- | --- |
-| Router/general answer | `gemma3:1b` | Reads the task context; answers directly or selects one available tool |
-| Tool specialist | `lfm2.5-thinking:1.2b` | Receives a compact handoff and selected tool schema, then returns a native tool call |
+| Action and tool decision | `lfm2.5-thinking:1.2b` | Produces a schema-constrained answer decision or a call to one available tool |
+| Final response | `gemma3:1b` | Turns the action context and observed tool output into the user-facing answer |
 
-With Ollama and `routing_mode = "auto"`, the run uses the persisted
-Router-Worker pipeline. Gemma routes the task. If a tool is needed, LFM produces
-the tool call; the existing executor applies authorization and runs it. Gemma
-then uses the recorded result to route again or answer. Each model request and
-response is saved as a separate step.
+`UnifiedLLM` is the model-facing interface, but it does not execute tools. It
+returns a typed tool call to `AgentRunner`; `ToolExecutor` validates the schema,
+permissions, and approval policy, then persists and executes the operation.
+The next invocation gives the observed result back to LFM. LFM decides when the
+work is complete, and Gemma writes the final answer from the verified output.
+For a direct-answer request, LFM supplies answer context and Gemma writes the
+response without a tool call. Both internal model requests and responses are
+included in the persisted step trace.
+
+With Ollama and `routing_mode = "auto"`, the harness uses this unified tool
+flow. Clearly requested built-in file operations are independently inferred
+and required by the harness, so the model cannot skip a requested read or
+substitute an answer. Tool schemas are constrained to the permitted operation;
+the executor remains the authorization boundary.
 
 Available modes:
 
 | Mode | Behavior |
 | --- | --- |
-| `auto` | Selects router-worker for Ollama; offline fake mode uses deterministic local routing |
-| `router_worker` | Force Gemma routing and LFM tool specialist |
+| `auto` | Uses the unified LFM-action/Gemma-answer flow with Ollama; explicit required tools are enforced |
+| `router_worker` | Compatibility mode; Ollama still routes through the unified interface |
 | `chat` | Answer without tool calls |
-| `tools` | Direct decision/tool flow using the decision model |
+| `tools` | Decision/tool flow through the configured model client |
 | `two_stage` | Produce a draft, then ask the response model for a final answer |
 
-Only the final answer is streamed to the CLI. In router-worker mode, the answer
-string is extracted from the router's JSON response as it arrives. Route JSON,
-tool arguments, and intermediate drafts are not displayed as the answer.
-Interactive chat reuses the Ollama client and connection pool across prompts.
+LFM output uses an Ollama JSON Schema requiring either a complete answer
+decision or a complete tool call. The CLI waits for the task to finish before
+displaying the answer; action JSON, tool arguments, and intermediate drafts are not shown.
+Interactive chat reuses the Ollama client and connection pool across prompts
+and includes the three most recent successful exchanges as follow-up context.
 
 ## Agents and task delegation
 
@@ -175,7 +186,10 @@ Default limits in `examples/ollama.toml`:
 Each resource also has a finite queue capacity. Full queues reject excess work
 with an explicit error rather than accumulating indefinitely. See
 `examples/ollama.toml` and `src/agent_harness/config.py` for all configurable
-queue, model, output, timeout, budget, retry, and memory settings.
+queue, model, output, timeout, budget, retry, and memory settings. Set either
+output-token option to `-1` for Ollama's no-per-request output cap, or to a
+positive integer for a bounded response. The model context window, run deadline,
+and total token budget still apply.
 
 ## MongoDB persistence
 

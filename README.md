@@ -2,8 +2,10 @@
 
 A local, durable agent that can answer questions, inspect and edit files in a
 chosen workspace, create artifacts, and split larger tasks among task-focused
-workers. With Ollama, it uses Gemma 3 1B as the router/general model and LFM 2.5
-as the tool specialist. Final answers stream to the terminal.
+workers. With Ollama, a unified model interface uses LFM 2.5 Thinking to choose
+an answer or a tool call, while Gemma 3 1B writes the final response. The
+harness—not either model—authorizes and executes tools. Responses appear after
+each task completes.
 
 Runs, model steps, tool activity, checkpoints, budgets, and optional memory are
 stored in MongoDB. The agent uses only the tools and workspace permissions
@@ -25,6 +27,8 @@ ollama pull lfm2.5-thinking:1.2b
 Set `AGENT_HARNESS_MONGODB_URI` in `.env` to your own MongoDB connection string.
 Keep credentials private and URL-encode reserved characters in the password.
 The database defaults to `test`. Do not commit `.env`.
+The default workspace is the current directory; `run.bat` starts in this
+`AIOS_HARNESS` folder. Set `workspace` in the TOML config to use another folder.
 
 Run one task:
 

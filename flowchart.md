@@ -100,7 +100,7 @@ flowchart TD
     FAIL --> EXIT
 ```
 
-## Ollama router-worker and streaming
+## Unified Ollama action, tool, and answer flow
 
 ```mermaid
 sequenceDiagram
@@ -109,46 +109,50 @@ sequenceDiagram
     participant CLI
     participant Runner as AgentRunner
     participant Gateway as ModelGateway
-    participant Gemma as Gemma router
-    participant LFM as LFM tool specialist
+    participant Unified as UnifiedLLM
+    participant LFM as LFM action model
     participant Tools as ToolExecutor
+    participant Gemma as Gemma answer model
     participant DB as MongoDB
 
     User->>CLI: Submit task
-    CLI->>Runner: execute(task, on_token)
-    Runner->>DB: Persist router request step + budget reservation
-    Runner->>Gateway: Generate router decision
-    Gateway->>Gemma: Full bounded task context, JSON route format
-    Gemma-->>Gateway: NDJSON response chunks
-    Gateway-->>Runner: Chunks + normalized final response
-
-    alt Router decides to answer
-        Runner->>Runner: Parse JSON answer safely
-        Runner-->>CLI: Stream only decoded answer text
-        Runner->>DB: Persist accepted decision and validated completion
-    else Router selects a tool
-        Note over Runner,LFM: Router output and tool arguments are not streamed
-        Runner->>DB: Persist route and tool-worker request
-        Runner->>Gateway: Generate one selected tool call
-        Gateway->>LFM: Compact handoff + selected tool schema
-        LFM-->>Gateway: Native tool-call response
-        Gateway-->>Runner: Validated tool-call response
-        Runner->>DB: Persist accepted step and invocation
-        Runner->>Tools: Validate authorization and execute
-        Tools->>DB: Persist invocation result / artifact metadata
-        Tools-->>Runner: Bounded observation
-        Runner->>DB: Persist next router step
-        Runner->>Gateway: Route again using observations
+    CLI->>Runner: execute(task)
+    Runner->>DB: Persist request step and budget reservation
+    Runner->>Gateway: Generate through the unified model interface
+    Gateway->>Unified: invoke(messages, tools)
+    Unified->>LFM: Task, tool schemas, verified observations
+    LFM-->>Unified: Structured answer decision or tool call
+    alt Tool call
+        Unified-->>Gateway: Typed tool call
+        Gateway-->>Runner: Normalized tool-call response
+        Runner->>DB: Persist accepted response
+        Runner->>Tools: Validate permissions and execute
+        Tools->>DB: Persist invocation and result
+        Tools-->>Runner: Bounded tool observation
+        Runner->>DB: Persist next request and observation
+        Runner->>Gateway: Invoke UnifiedLLM with observation
+        Gateway->>Unified: Continue composite flow
+        Unified->>LFM: Task and observed tool results
+        LFM-->>Unified: Answer decision
+        Unified->>Gemma: User request, answer context, tool evidence
+        Gemma-->>Unified: Final natural-language answer
+        Unified-->>Gateway: Composite final response and internal trace
+        Gateway-->>Runner: Normalized final response
+    else Direct answer
+        Unified->>Gemma: User request and LFM answer context
+        Gemma-->>Unified: Final natural-language answer
+        Unified-->>Gateway: Composite final response and internal trace
+        Gateway-->>Runner: Normalized final response
     end
-
-    Runner->>DB: Persist terminal state and trace events
+    Runner->>DB: Persist validated completion
+    Runner->>CLI: Display answer after task completion
     CLI-->>User: Final status / JSON summary
 ```
 
-Streaming is intentionally limited to user-facing final-answer content.
-Intermediate router JSON is decoded incrementally so JSON escapes are rendered
-as ordinary text. Tool-call arguments, routing decisions, and intermediate
-drafts are not sent to the terminal.
+The adapter never executes tools: the durable runner and `ToolExecutor` remain
+the authorization and side-effect boundary. Both model calls are recorded in
+the step's internal trace; tool arguments and intermediate decisions are not
+displayed in the terminal.
 
 ## Delegation and parallel children
 

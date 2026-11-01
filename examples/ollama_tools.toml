@@ -5,7 +5,7 @@ decision_model = "lfm2.5-thinking:1.2b"
 response_model = "gemma3:1b"
 max_steps = 8
 timeout_seconds = 600
-max_output_tokens = 4096
+max_output_tokens = -1
 max_input_bytes = 16384
 tool_allowlist = [
     "calculator",
@@ -22,7 +22,7 @@ tool_allowlist = [
 ]
 required_tools = ["calculator", "artifact_write", "artifact_read"]
 routing_mode = "tools"
-response_max_tokens = 512
+response_max_tokens = -1
 model_concurrency = 2
 model_queue_capacity = 8
 model_provider_concurrency = 2

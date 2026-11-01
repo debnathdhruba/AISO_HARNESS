@@ -6,16 +6,44 @@ from agent_harness.domain.errors import require
 from agent_harness.domain.model import RunOptions
 
 
+def infer_required_tool(task: str) -> str | None:
+    text = task.lower()
+    file_reference = re.search(
+        r"\b(?:files?|folders?|directories|workspace|readme(?:\.\w+)?|"
+        r"[\w.-]+\.(?:md|txt|json|csv|py|toml|ya?ml))\b",
+        text,
+    )
+    if file_reference is None:
+        return None
+    if re.search(r"\b(list|enumerate)\b", text) and re.search(
+        r"\b(files?|folders?|directories|workspace)\b", text
+    ):
+        return "list_files"
+    if re.search(r"\b(search|grep)\b", text) or (
+        re.search(r"\bfind\b", text) and re.search(r"\b(for|inside|within)\b", text)
+    ):
+        return "search_files"
+    if re.search(r"\b(edit|replace|update)\b", text):
+        return "edit_file"
+    if re.search(r"\b(write|create|save)\b", text):
+        return "write_file"
+    if re.search(r"\b(read|open|show|display|view|summari[sz]e)\b", text):
+        if re.search(r"\blines?\s+\d+\b", text):
+            return "read_file_range"
+        return "read_file"
+    return None
+
+
 def select_mode(task: str, options: RunOptions) -> str:
     if options.required_tools:
         require(options.routing_mode != "chat", "Chat mode cannot satisfy required tools")
-        if options.provider == "ollama" and options.routing_mode == "auto":
-            return "router_worker"
+        return "tools"
+    if options.routing_mode == "router_worker":
         return "tools"
     if options.routing_mode != "auto":
         return options.routing_mode
     if options.provider == "ollama":
-        return "router_worker"
+        return "tools"
     text = task.lower().strip()
     explicit = re.search(
         r"\b(calculator|artifact_(write|read|list)|list_files|read_file_range|"

@@ -21,6 +21,7 @@ class FinishReason(StrEnum):
     TOOL_CALLS = "tool_calls"
     LENGTH = "length"
     UNSUPPORTED = "unsupported"
+    COMPOSITE_FINAL = "composite_final"
 
 
 class Stage(StrEnum):
@@ -91,12 +92,27 @@ class ModelRequest:
     max_output_tokens: int
     tools: tuple[ToolSpec, ...] = ()
     json_mode: bool = False
+    json_schema: JsonObject | None = None
+    required_tools: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         identifier(self.request_id)
         require(bool(self.model.strip()) and bool(self.messages), "Model and messages required")
-        require(1 <= self.max_output_tokens <= 8192, "Invalid output token limit")
+        require(
+            self.max_output_tokens == -1 or self.max_output_tokens >= 1,
+            "Output token limit must be positive or -1 for no per-request cap",
+        )
         require(isinstance(self.json_mode, bool), "JSON mode must be an explicit boolean")
+        require(
+            self.json_schema is None or isinstance(self.json_schema, JsonObject),
+            "Structured output schema must be JSON",
+        )
+        require(
+            not self.required_tools
+            or set(self.required_tools) <= {tool.name for tool in self.tools}
+            or self.json_schema is not None,
+            "Required model tools must be available in the request",
+        )
 
 
 @dataclass(frozen=True)
@@ -104,6 +120,7 @@ class ModelResponse:
     message: Message
     finish_reason: FinishReason
     usage: Usage = Usage()
+    raw_trace: tuple[JsonObject, ...] = ()
 
     def __post_init__(self) -> None:
         require(self.message.role == Role.ASSISTANT, "Response must be an assistant message")
@@ -187,7 +204,10 @@ class RunOptions:
             self.routing_mode != "router_worker" or self.provider == "ollama",
             "Router-worker mode requires the Ollama provider",
         )
-        require(1 <= self.response_max_tokens <= 8192, "Invalid response token limit")
+        require(
+            self.response_max_tokens == -1 or self.response_max_tokens >= 1,
+            "Response token limit must be positive or -1 for no per-request cap",
+        )
         require(
             1 <= self.max_total_steps <= 4096
             and 1 <= self.max_total_tokens <= 10_000_000
@@ -222,7 +242,10 @@ class RunOptions:
         )
         require(1 <= self.max_steps <= 100, "Step limit must be 1..100")
         require(1 <= self.timeout_seconds <= 3600, "Timeout must be 1..3600 seconds")
-        require(1 <= self.max_output_tokens <= 8192, "Output limit must be 1..8192 tokens")
+        require(
+            self.max_output_tokens == -1 or self.max_output_tokens >= 1,
+            "Output token limit must be positive or -1 for no per-request cap",
+        )
         require(256 <= self.max_input_bytes <= 131072, "Input limit must be 256..131072 bytes")
         require(
             1 <= self.max_tool_calls <= 100 and 1 <= self.repeated_action_limit <= 10,

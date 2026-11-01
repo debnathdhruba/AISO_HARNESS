@@ -21,6 +21,7 @@ from agent_harness.domain.errors import require
 from agent_harness.domain.memory import MemorySharing
 from agent_harness.domain.model import RunOptions
 from agent_harness.domain.tooling import Invocation
+from agent_harness.llm.unified import UnifiedLLM
 from agent_harness.memory import MemoryService
 from agent_harness.models.gateway import ModelGateway
 from agent_harness.persistence.mongo import MongoStore
@@ -126,7 +127,12 @@ async def runner(
                     max_connections=settings.model_provider_concurrency,
                 )
             )
-            client = ollama
+            client = UnifiedLLM(
+                ollama,
+                tool_model=settings.decision_model,
+                answer_model=settings.response_model,
+                max_input_bytes=settings.max_input_bytes,
+            )
         agent_holder: dict[str, AgentRunner] = {}
 
         async def delegate(invocation: Invocation) -> JsonObject:

@@ -5,9 +5,9 @@ from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
 
-from agent_harness.application.routing import select_mode
+from agent_harness.application.routing import infer_required_tool, select_mode
 from agent_harness.domain.entities import JsonObject, Run, RunConfig, Task
-from agent_harness.domain.errors import ErrorCode, HarnessError
+from agent_harness.domain.errors import ErrorCode, HarnessError, require
 from agent_harness.domain.model import RunOptions
 from agent_harness.domain.states import ControlIntent, RunStatus, TaskStatus
 from agent_harness.ports.state import Clock, IdGenerator, StateStore
@@ -17,13 +17,39 @@ class RunService:
     def __init__(self, store: StateStore, clock: Clock, ids: IdGenerator) -> None:
         self._store, self._clock, self._ids = store, clock, ids
 
-    async def submit(self, user_id: str, task_input: str, options: RunOptions) -> Run:
+    async def submit(
+        self,
+        user_id: str,
+        task_input: str,
+        options: RunOptions,
+        *,
+        conversation_context: str | None = None,
+    ) -> Run:
+        inferred_tool = infer_required_tool(task_input)
+        required_tools = tuple(
+            dict.fromkeys((*options.required_tools, *((inferred_tool,) if inferred_tool else ())))
+        )
+        if inferred_tool is not None:
+            require(
+                inferred_tool in options.tool_allowlist,
+                f"Requested operation requires unavailable tool: {inferred_tool}",
+            )
+        options = replace(options, required_tools=required_tools)
+        routing_mode = select_mode(task_input, options)
         options = replace(
             options,
             workspace=str(Path(options.workspace).absolute()),
             artifact_root=str(Path(options.artifact_root).absolute()),
-            routing_mode=select_mode(task_input, options),
+            routing_mode=routing_mode,
         )
+        if conversation_context:
+            task_input = (
+                "Prior conversation context (use only to resolve the current request; "
+                "do not repeat earlier tasks):\n"
+                + conversation_context
+                + "\n\nCurrent user request:\n"
+                + task_input
+            )
         now = self._clock.utc_now()
         task_id = self._ids.new_id()
         config = RunConfig(

@@ -96,9 +96,10 @@ class RouterWorkerPipeline:
             + required
             + "\nAvailable tools: "
             + json.dumps(catalog, ensure_ascii=False, separators=(",", ":"))
-            + "\nReturn exactly one JSON object with no markdown. For an answer use "
-            '{"action":"answer","answer":"user-facing answer"}. For a tool use '
-            '{"action":"tool","tool":"exact_tool_name","context":"minimal relevant details"}.'
+            + "\nReturn exactly one JSON object with no markdown. Set action to answer and "
+            "answer to your actual reply when no tool is needed. Set action to tool, tool to "
+            "the exact available tool name, and context to the minimum task details needed "
+            "when a tool is needed. Do not copy these instructions into the answer."
         )
 
     @staticmethod

@@ -583,7 +583,10 @@ class AgentRunner:
                                 )
                                 await self._checkpoint(tx, waiting, task_id, latest)
                                 return waiting
-                elif response.finish_reason != FinishReason.STOP:
+                elif response.finish_reason not in {
+                    FinishReason.STOP,
+                    FinishReason.COMPOSITE_FINAL,
+                }:
                     error = HarnessError(
                         ErrorCode.VALIDATION,
                         "Model response is truncated or has an unsupported finish",
@@ -620,11 +623,15 @@ class AgentRunner:
                         await on_token(final_answer)
                 else:
                     final_answer = response.message.content
-                if latest.stage == Stage.RESPONSE or (
-                    router_worker
-                    and latest.stage == Stage.ROUTER
-                    and router_decision is not None
-                    and router_decision.action == RouteAction.ANSWER
+                if (
+                    latest.stage == Stage.RESPONSE
+                    or (response.finish_reason == FinishReason.COMPOSITE_FINAL)
+                    or (
+                        router_worker
+                        and latest.stage == Stage.ROUTER
+                        and router_decision is not None
+                        and router_decision.action == RouteAction.ANSWER
+                    )
                 ):
                     if outstanding_tools:
                         return await self._finish(
@@ -741,7 +748,12 @@ class AgentRunner:
                             task_id,
                             BudgetUsage(
                                 steps=1,
-                                tokens=options.max_input_bytes + latest.request.max_output_tokens,
+                                tokens=options.max_input_bytes
+                                + (
+                                    latest.request.max_output_tokens
+                                    if latest.request.max_output_tokens > 0
+                                    else options.max_input_bytes
+                                ),
                                 tool_calls=0,
                             ),
                         )
@@ -1042,6 +1054,7 @@ class AgentRunner:
                 else options.response_max_tokens,
                 specs,
                 json_mode=router_worker and stage == Stage.ROUTER,
+                required_tools=outstanding_tools if stage == Stage.DECISION else (),
             )
             step = Step(
                 self._ids.new_id(), task_id, run_id, user_id, len(steps) + 1, stage, request
@@ -1054,7 +1067,12 @@ class AgentRunner:
                     task_id,
                     BudgetUsage(
                         steps=1,
-                        tokens=options.max_input_bytes + request.max_output_tokens,
+                        tokens=options.max_input_bytes
+                        + (
+                            request.max_output_tokens
+                            if request.max_output_tokens > 0
+                            else options.max_input_bytes
+                        ),
                         tool_calls=0,
                     ),
                 )
