@@ -633,13 +633,38 @@ class MongoStore:
             "invocations",
         }
         indexes: dict[str, list[IndexModel]] = {}
+
+        def add_index(collection: str, model: IndexModel) -> None:
+            document = model.document
+            keys = tuple(document["key"].items())
+            options = {
+                key: value for key, value in document.items() if key not in {"key", "name"}
+            }
+            collection_indexes = indexes.setdefault(collection, [])
+            for existing in collection_indexes:
+                existing_document = existing.document
+                if tuple(existing_document["key"].items()) != keys:
+                    continue
+                existing_options = {
+                    key: value
+                    for key, value in existing_document.items()
+                    if key not in {"key", "name"}
+                }
+                require(
+                    existing_options == options,
+                    f"Conflicting index options for {collection} {keys}",
+                )
+                return
+            collection_indexes.append(model)
+
         for collection_name, keys in definitions.items():
             physical = COLLECTION_BUCKETS.get(collection_name, "telemetry")
-            indexes.setdefault(physical, []).append(
+            add_index(
+                physical,
                 IndexModel(
                     [("_kind", ASCENDING), *keys],
                     unique=collection_name in unique_compound,
-                )
+                ),
             )
         for collection_name, field in (
             ("events", "event_id"),
@@ -651,7 +676,8 @@ class MongoStore:
             ("checkpoints", "task_id"),
         ):
             physical = COLLECTION_BUCKETS.get(collection_name, "telemetry")
-            indexes.setdefault(physical, []).append(
+            add_index(
+                physical,
                 IndexModel([("_kind", ASCENDING), (field, ASCENDING)], unique=True)
             )
         for collection_name, field in (
@@ -660,10 +686,12 @@ class MongoStore:
             ("budget_reservations", "reservation_id"),
         ):
             physical = COLLECTION_BUCKETS.get(collection_name, "telemetry")
-            indexes.setdefault(physical, []).append(
+            add_index(
+                physical,
                 IndexModel([("_kind", ASCENDING), (field, ASCENDING)], unique=True)
             )
-        indexes["telemetry"].append(
+        add_index(
+            "telemetry",
             IndexModel(
                 [
                     ("_kind", ASCENDING),
@@ -672,7 +700,7 @@ class MongoStore:
                     ("task_id", ASCENDING),
                 ],
                 name="telemetry_invocations_user_run_task",
-            )
+            ),
         )
         await asyncio.gather(
             *(

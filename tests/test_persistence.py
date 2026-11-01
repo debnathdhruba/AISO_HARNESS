@@ -12,9 +12,40 @@ from agent_harness.domain.errors import ErrorCode, HarnessError
 from agent_harness.domain.states import ControlIntent, RunStatus, TaskStatus
 from agent_harness.memory.backends.codec import encode
 from agent_harness.memory.backends.migrations import MIGRATIONS
+from agent_harness.memory.backends.mongo import MongoStore
 from agent_harness.memory.backends.sqlite import SQLiteStore
 
 pytestmark = pytest.mark.asyncio
+
+
+async def test_mongo_index_setup_deduplicates_shared_logical_indexes() -> None:
+    class Collection:
+        def __init__(self) -> None:
+            self.indexes = []
+
+        async def create_indexes(self, indexes):
+            self.indexes = indexes
+
+    class Database:
+        def __init__(self) -> None:
+            self.collections = {}
+
+        def __getitem__(self, name: str) -> Collection:
+            return self.collections.setdefault(name, Collection())
+
+    store = MongoStore("mongodb://127.0.0.1:27017", "test", FixedClock(), SequenceIds())
+    fake_database = Database()
+    store._database = fake_database
+    try:
+        await store._ensure_indexes()
+        telemetry_indexes = fake_database.collections["telemetry"].indexes
+        signatures = [
+            (tuple(index.document["key"].items()), index.document.get("unique", False))
+            for index in telemetry_indexes
+        ]
+        assert len(signatures) == len(set(signatures))
+    finally:
+        await store._client.close()
 
 
 async def seed(store: SQLiteStore, run: Run, task: Task) -> None:
